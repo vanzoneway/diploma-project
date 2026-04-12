@@ -1,0 +1,2672 @@
+// Файл: cab-aggregator-exception-spring-boot-starter/src/main/java/com/modsen/cabaggregatorexceptionspringbootstarter/exception/AccessToResourcesDeniedException.java
+public class AccessToResourcesDeniedException extends RuntimeException {
+    public AccessToResourcesDeniedException(String message) {
+        super(message);
+    }
+}
+
+// Файл: cab-aggregator-exception-spring-boot-starter/src/main/java/com/modsen/cabaggregatorexceptionspringbootstarter/exception/ApiExceptionDto.java
+@Getter
+@Setter
+@AllArgsConstructor
+@NoArgsConstructor
+@Schema(description = "Data Transfer Object for API exceptions")
+public class ApiExceptionDto implements Serializable {
+    @Schema(description = "HTTP status of the error", example = "404", required = true)
+    private HttpStatus status;
+    @Schema(description = "Error message describing the issue", example = "Resource not found", required = true)
+    private String message;
+    @Schema(description = "Timestamp when the error occurred", example = "2023-09-30T15:30:00")
+    private LocalDateTime timestamp;
+}
+
+// Файл: cab-aggregator-exception-spring-boot-starter/src/main/java/com/modsen/cabaggregatorexceptionspringbootstarter/exception/BasicGlobalExceptionHandler.java
+@RestControllerAdvice
+@Slf4j
+public class BasicGlobalExceptionHandler {
+    @ExceptionHandler({AccessToResourcesDeniedException.class})
+    @ResponseStatus(HttpStatus.FORBIDDEN)
+    public ApiExceptionDto handleAccessToResourcesDeniedException(AccessToResourcesDeniedException e) {
+        return new ApiExceptionDto(HttpStatus.FORBIDDEN, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler({AuthorizationDeniedException.class})
+    @ResponseStatus(HttpStatus.FORBIDDEN)
+    public ApiExceptionDto handleForbiddenException(AuthorizationDeniedException e) {
+        return new ApiExceptionDto(HttpStatus.FORBIDDEN, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(Exception.class)
+    @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
+    public ApiExceptionDto handleAnyException(Exception e) {
+        log.error(e.getMessage(), e);
+        return new ApiExceptionDto(
+                HttpStatus.INTERNAL_SERVER_ERROR,
+                AppConstants.INTERNAL_SERVER_ERROR,
+                LocalDateTime.now());
+    }
+    @ExceptionHandler(ConstraintViolationException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ValidationErrorResponse handleConstraintValidationException(ConstraintViolationException e) {
+        final List<Violation> violations = e.getConstraintViolations().stream()
+                .map(
+                        violation -> new Violation(
+                                violation.getPropertyPath().toString().replaceFirst(".*\\.", ""),
+                                violation.getMessage()
+                        )
+                )
+                .collect(Collectors.toList());
+        return new ValidationErrorResponse(violations);
+    }
+    @ExceptionHandler({MethodArgumentNotValidException.class})
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ValidationErrorResponse handleMethodArgumentNotValidException(MethodArgumentNotValidException e) {
+        final List<Violation> violations = e.getBindingResult().getFieldErrors().stream()
+                .map(error -> new Violation(error.getField(), error.getDefaultMessage()))
+                .collect(Collectors.toList());
+        return new ValidationErrorResponse(violations);
+    }
+}
+
+// Файл: cab-aggregator-request-response-logger-spring-boot-starter/src/main/java/com/modsen/cabaggregatorrequestresponseloggerspringbootstarter/logger/RequestResponseLogger.java
+@Slf4j
+@AllArgsConstructor
+@Component
+@Aspect
+public class RequestResponseLogger {
+    private final ObjectMapper objectMapper;
+    private static final String REQUEST_LOGGING_MESSAGE = """
+                   \s
+            Request:
+            Method: {}
+            URI: {}
+            Headers: {}
+            Body: {}
+           \s""";
+    private static final String RESPONSE_LOGGING_MESSAGE = """
+                   \s
+            Response:
+            Method: {}
+            URI: {}
+            Body: {}
+            Time Taken: {} ms
+           \s""";
+    private static final String ERROR_SERIALIZING_JSON_MESSAGE = "Error serializing object to JSON";
+    private static final String ERROR_SERIALIZING_REQUEST_BODY_MESSAGE = "Error serializing request body";
+    @Around("@within(org.springframework.web.bind.annotation.RestController) && execution(* *(..))")
+    public Object logHttpRequestResponse(ProceedingJoinPoint joinPoint) throws Throwable {
+        HttpServletRequest request =
+                ((ServletRequestAttributes) Objects.requireNonNull(RequestContextHolder.getRequestAttributes())).getRequest();
+        String requestBody = getRequestBody(joinPoint);
+        log.info(REQUEST_LOGGING_MESSAGE,
+                request.getMethod(),
+                getRequestURIWithQueryString(request),
+                getHeaders(request),
+                requestBody
+        );
+        return getResponse(joinPoint, request);
+    }
+    @Around("@within(org.springframework.web.bind.annotation.RestControllerAdvice) && execution(* *(..))")
+    public Object logHttpRequestResponseIfGlobalExceptionHandler(ProceedingJoinPoint joinPoint) throws Throwable {
+        HttpServletRequest request =
+                ((ServletRequestAttributes) Objects.requireNonNull(RequestContextHolder.getRequestAttributes())).getRequest();
+        return getResponse(joinPoint, request);
+    }
+    private String getRequestURIWithQueryString(HttpServletRequest request) {
+        String requestURI = request.getRequestURI();
+        String queryString = request.getQueryString();
+        if (queryString != null) {
+            return requestURI + "?" + queryString;
+        }
+        return requestURI;
+    }
+    private String getHeaders(HttpServletRequest request) {
+        StringBuilder result = new StringBuilder();
+        Enumeration<String> headerNames = request.getHeaderNames();
+        while (headerNames.hasMoreElements()) {
+            String headerName = headerNames.nextElement();
+            String headerValue = request.getHeader(headerName);
+            result.append(headerName).append(": ").append(headerValue).append("\n");
+        }
+        result.deleteCharAt(result.length() - 1);
+        return result.toString();
+    }
+    private Object getResponse(ProceedingJoinPoint joinPoint, HttpServletRequest request)
+            throws Throwable {
+        long startTime = System.currentTimeMillis();
+        long endTime;
+        Object response;
+        response = joinPoint.proceed();
+        endTime = System.currentTimeMillis();
+        long duration = endTime - startTime;
+        String responseBody = convertObjectToJson(response);
+        log.info(RESPONSE_LOGGING_MESSAGE,
+                request.getMethod(),
+                getRequestURIWithQueryString(request),
+                responseBody,
+                duration
+        );
+        return response;
+    }
+    private String getRequestBody(ProceedingJoinPoint joinPoint) {
+        MethodSignature methodSignature = (MethodSignature) joinPoint.getSignature();
+        Method method = methodSignature.getMethod();
+        Object[] args = joinPoint.getArgs();
+        for (int i = 0; i < args.length; i++) {
+            if (method.getParameterAnnotations()[i] != null) {
+                for (Annotation annotation : method.getParameterAnnotations()[i]) {
+                    if (annotation instanceof RequestBody) {
+                        try {
+                            return convertObjectToJson(args[i]);
+                        } catch (Exception e) {
+                            log.error(ERROR_SERIALIZING_REQUEST_BODY_MESSAGE, e);
+                        }
+                    }
+                }
+            }
+        }
+        return "";
+    }
+    private String convertObjectToJson(Object object) {
+        if (object == null)
+            return "";
+        try {
+            if (object instanceof ResponseEntity<?> re
+                    && re.getBody() instanceof InputStreamResource) {
+                return "[Input stream]";
+            }
+            String result = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(object);
+            return result.substring(0, result.length() - 1);
+        } catch (Exception e) {
+            log.error(ERROR_SERIALIZING_JSON_MESSAGE, e);
+            return ERROR_SERIALIZING_JSON_MESSAGE;
+        }
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/aspect/ValidateAccessToResources.java
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface ValidateAccessToResources {
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/aspect/ValidateAccessToResourcesAspect.java
+@Aspect
+@Component
+@RequiredArgsConstructor
+public class ValidateAccessToResourcesAspect {
+    private final DriverService driverService;
+    private static final String ROLE_ADMIN_VALUE = "ROLE_ADMIN";
+    private static final String EMAIL_CLAIM = "email";
+    private static final String DEFAULT_ACCESS_DENIED_MESSAGE = "Access denied";
+    @Around("@annotation(com.modsen.driverservice.aspect.ValidateAccessToResources)")
+    public Object hasPermission(ProceedingJoinPoint joinPoint) throws Throwable {
+        Object[] args = joinPoint.getArgs();
+        JwtAuthenticationToken token = (JwtAuthenticationToken) args[args.length - 1];
+        Long userId = (Long) args[0];
+        if (token.getAuthorities().stream()
+                .filter(Objects::nonNull)
+                .anyMatch(authority -> authority.getAuthority()
+                        .equals(ROLE_ADMIN_VALUE))) {
+            return joinPoint.proceed();
+        }
+        if (!Objects.equals(driverService.getDriverById(userId).email(),
+                token.getToken().getClaims().get(EMAIL_CLAIM))) {
+            throw new AccessToResourcesDeniedException(DEFAULT_ACCESS_DENIED_MESSAGE);
+        }
+        return joinPoint.proceed();
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/client/CustomFeignClientException.java
+@Getter
+public class CustomFeignClientException extends RuntimeException {
+    private final ApiExceptionDto apiExceptionDto;
+    public CustomFeignClientException(ApiExceptionDto apiExceptionDto) {
+        this.apiExceptionDto = apiExceptionDto;
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/client/FeignClientErrorDecoder.java
+@Component
+public class FeignClientErrorDecoder implements ErrorDecoder {
+    private final Default eDefault = new Default();
+    @Override
+    @SneakyThrows
+    public Exception decode(String s, Response response) {
+        ObjectMapper objectMapper = new ObjectMapper();
+        objectMapper.registerModule(new JavaTimeModule());
+        ApiExceptionDto apiExceptionDto;
+        if (response.status() >= HttpStatus.INTERNAL_SERVER_ERROR.value()) {
+            return eDefault.decode(s, response);
+        }
+        apiExceptionDto = objectMapper.readValue(readResponseBody(response), ApiExceptionDto.class);
+        return new CustomFeignClientException(apiExceptionDto);
+    }
+    @SneakyThrows
+    private String readResponseBody(Response response) {
+        if (Objects.nonNull(response.body())) {
+            @Cleanup InputStreamReader inputStreamReader = new InputStreamReader(response.body()
+                    .asInputStream(), StandardCharsets.UTF_8);
+            StringBuilder builder = new StringBuilder();
+            BufferedReader reader = new BufferedReader(inputStreamReader);
+            String line;
+            while ((line = reader.readLine()) != null) {
+                builder.append(line);
+            }
+            return builder.toString();
+        }
+        return "";
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/client/ride/RideFeignClientFallbackFactory.java
+@Component
+public class RideFeignClientFallbackFactory implements FallbackFactory<RideFeignClient> {
+    @Override
+    public RideFeignClient create(Throwable cause) {
+        return (driverId) -> {
+            if (cause.getCause() instanceof CustomFeignClientException customFeignClientException) {
+                throw customFeignClientException;
+            }
+            throw new ServerErrorException(cause.getMessage(), cause);
+        };
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/controller/impl/AvatarController.java
+@RestController
+@RequiredArgsConstructor
+@RequestMapping("/api/v1/drivers")
+public class AvatarController implements AvatarOperations {
+    private final AvatarService avatarService;
+    @Override
+    @PostMapping("/{id}/avatars/upload")
+    @PreAuthorize("hasRole('ADMIN') or hasRole('DRIVER')")
+    @ValidateAccessToResources
+    public ResponseEntity<InputStreamResource> uploadAvatar(@PathVariable("id") Long id, @RequestParam("file") MultipartFile file,
+                                       JwtAuthenticationToken jwtAuthenticationToken) {
+        MinioFileInformation minioFileInformation = avatarService.uploadAvatar(id, file);
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .header(HttpHeaders.CONTENT_DISPOSITION, AvatarServiceLiteralConstants.CONTENT_DISPOSITION_VALUE)
+                .contentType(minioFileInformation.mediaType())
+                .body(new InputStreamResource(minioFileInformation.is()));
+    }
+    @Override
+    @GetMapping("/{id}/avatars")
+    public ResponseEntity<InputStreamResource> getAvatar(@PathVariable("id") Long id) {
+        MinioFileInformation minioFileInformation = avatarService.getAvatar(id);
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, AvatarServiceLiteralConstants.CONTENT_DISPOSITION_VALUE)
+                .contentType(minioFileInformation.mediaType())
+                .body(new InputStreamResource(minioFileInformation.is()));
+    }
+    @Override
+    @DeleteMapping("/{id}/avatars")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("hasRole('ADMIN') or hasRole('DRIVER')")
+    @ValidateAccessToResources
+    public void deleteAvatar(@PathVariable("id") Long id, JwtAuthenticationToken jwtAuthenticationToken) {
+        avatarService.deleteAvatar(id);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/controller/impl/CarController.java
+@RestController
+@RequestMapping("/api/v1/cars")
+@RequiredArgsConstructor
+public class CarController implements CarOperations {
+    private final CarService carService;
+    @Override
+    @PostMapping("/drivers/{driverId}")
+    @ResponseStatus(HttpStatus.CREATED)
+    @PreAuthorize("hasRole('ADMIN')")
+    public CarDto createCar(@PathVariable Long driverId,
+                            @RequestBody @Valid CarDto carDto) {
+        return carService.createCar(driverId, carDto);
+    }
+    @Override
+    @PutMapping("/{carId}/drivers/{driverId}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public CarDto updateCarByCarIdAndDriverId(@PathVariable Long carId,
+                                              @PathVariable Long driverId,
+                                              @RequestBody @Valid CarDto carDto) {
+        return carService.updateCarByCarIdAndDriverId(carId, driverId, carDto);
+    }
+    @Override
+    @DeleteMapping("/{carId}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("hasRole('ADMIN')")
+    public void safeDeleteCarById(@PathVariable Long carId) {
+        carService.safeDeleteCarByCarId(carId);
+    }
+    @Override
+    @GetMapping("/{carId}")
+    public CarDto getCarById(@PathVariable Long carId) {
+        return carService.getCarById(carId);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/controller/impl/DriverController.java
+@RestController
+@RequestMapping("/api/v1/drivers")
+@RequiredArgsConstructor
+public class DriverController implements DriverOperations {
+    private final DriverService driverService;
+    @Override
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    @PreAuthorize("hasRole('ADMIN')")
+    public DriverDto createDriver(@RequestBody @Valid DriverDto driverDto) {
+        return driverService.createDriver(driverDto);
+    }
+    @Override
+    @GetMapping
+    public ListContainerResponseDto<DriverDto> getPageDrivers(@RequestParam(defaultValue = "0") @Min(0) Integer offset,
+                                                   @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer limit) {
+        return driverService.getPageDrivers(offset, limit);
+    }
+    @Override
+    @DeleteMapping("/{driverId}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("hasRole('ADMIN') or hasRole('DRIVER')")
+    @ValidateAccessToResources
+    public void safeDeleteDriver(@PathVariable Long driverId, JwtAuthenticationToken jwtAuthenticationToken) {
+        driverService.safeDeleteDriverByDriverId(driverId);
+    }
+    @Override
+    @PutMapping("/{driverId}")
+    @PreAuthorize("hasRole('ADMIN') or hasRole('DRIVER')")
+    @ValidateAccessToResources
+    public DriverDto updateDriverById(@PathVariable Long driverId, @RequestBody @Valid DriverDto driverDto,
+                                      JwtAuthenticationToken jwtAuthenticationToken) {
+        return driverService.updateDriverById(driverId, driverDto);
+    }
+    @Override
+    @GetMapping("/{driverId}")
+    public DriverDto getDriverById(@PathVariable Long driverId) {
+        return driverService.getDriverById(driverId);
+    }
+    @Override
+    @GetMapping("/{driverId}/cars")
+    public DriverCarDto getDriverWithCars(@PathVariable Long driverId) {
+        return driverService.getDriverWithCars(driverId);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/controller/impl/StatisticReportController.java
+@RestController
+@RequestMapping("/api/v1/drivers/notifications")
+@RequiredArgsConstructor
+public class StatisticReportController implements StatisticReportOperations {
+    private final StatisticReportService statisticReportService;
+    @Override
+    @PostMapping
+    public void triggerSendingReports() {
+        statisticReportService.scheduledSenderStatisticToNotificationService();
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/exception/GlobalExceptionHandler.java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    @ExceptionHandler({DriverNotFoundException.class, CarNotFoundException.class})
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ApiExceptionDto handleDriverNotFoundException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.NOT_FOUND, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler({DuplicateCarNumbersException.class, DuplicateDriverEmailPhoneException.class})
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ApiExceptionDto handleDuplicateCarNumbersException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.CONFLICT, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    @ResponseStatus(HttpStatus.PAYLOAD_TOO_LARGE)
+    public ApiExceptionDto handleMaxUploadSizeExceededException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.PAYLOAD_TOO_LARGE, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(UnsupportedFileTypeException.class)
+    @ResponseStatus(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
+    public ApiExceptionDto handleUnsupportedFileTypeException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.UNSUPPORTED_MEDIA_TYPE, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(NoSuchAvatarException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ApiExceptionDto handleNoSuchAvatarException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.NOT_FOUND, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(MultipartException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ApiExceptionDto handleMultipartException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.BAD_REQUEST, e.getMessage(), LocalDateTime.now());
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/exception/avatar/NoSuchAvatarException.java
+public class NoSuchAvatarException extends RuntimeException {
+    public NoSuchAvatarException(String message) {
+        super(message);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/exception/avatar/UnsupportedFileTypeException.java
+public class UnsupportedFileTypeException extends RuntimeException {
+    public UnsupportedFileTypeException(String message) {
+        super(message);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/exception/car/CarNotFoundException.java
+public class CarNotFoundException extends RuntimeException {
+    public CarNotFoundException(String message) {
+        super(message);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/exception/car/DuplicateCarNumbersException.java
+public class DuplicateCarNumbersException extends RuntimeException {
+    public DuplicateCarNumbersException(String message) {
+        super(message);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/exception/driver/DriverNotFoundException.java
+public class DriverNotFoundException extends RuntimeException {
+    public DriverNotFoundException(String message) {
+        super(message);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/exception/driver/DuplicateDriverEmailPhoneException.java
+public class DuplicateDriverEmailPhoneException extends RuntimeException {
+    public DuplicateDriverEmailPhoneException(String message) {
+        super(message);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/kafka/KafkaConstants.java
+@NoArgsConstructor(access = AccessLevel.PRIVATE)
+public final class KafkaConstants {
+    //KafkaConsumerConfig
+    public static final String BOOTSTRAP_SERVERS_FROM_APP_YAML = "${spring.kafka.consumer.bootstrap-servers}";
+    public static final String AUTO_OFFSET_RESET_CONFIG_VALUE = "earliest";
+    public static final String TRUSTED_PACKAGES_VALUE = "*";
+    //AverageRatingListener
+    public static final String TOPIC_NAME_AVERAGE_RATING_FROM_RATING_SERVICE = "driver-average-rating-topic";
+    public static final String GROUP_ID_AVERAGE_RATING_FROM_RATING_SERVICE = "driver-consumer";
+    public static final String TARGET_DTO_FOR_DESERIALIZATION_PROPERTY =
+            "spring.json.value.default.type=com.modsen.driverservice.dto.AverageRatingResponseDto";
+    //GeneralStatisticProducerConfig
+    public static final String GENERAL_USER_STATISTIC_TOPIC_NAME = "user-statistics-topic";
+    //Common
+    public static final String BASE_KAFKA_LISTENER_CONTAINER_FACTORY = "kafkaListenerContainerFactory";
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/kafka/KafkaConsumerConfig.java
+@Configuration
+@EnableKafka
+public class KafkaConsumerConfig {
+    @Value(KafkaConstants.BOOTSTRAP_SERVERS_FROM_APP_YAML)
+    private List<String> bootstrapAddress;
+    @Bean
+    public ConsumerFactory<String, Object> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
+                bootstrapAddress);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, KafkaConstants.AUTO_OFFSET_RESET_CONFIG_VALUE);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+                StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, KafkaConstants.TRUSTED_PACKAGES_VALUE);
+        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+        props.put(JsonDeserializer.REMOVE_TYPE_INFO_HEADERS, true);
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, Object> kafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory<String, Object> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.getContainerProperties().setObservationEnabled(true);
+        factory.setConsumerFactory(consumerFactory());
+        return factory;
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/kafka/KafkaProducerConfig.java
+@Configuration
+public class KafkaProducerConfig {
+    private static final int AMOUNT_OF_REPLICAS = 3;
+    private static final int AMOUNT_OF_PARTITIONS = 3;
+    @Value(KafkaConstants.BOOTSTRAP_SERVERS_FROM_APP_YAML)
+    private List<String> bootstrapAddress;
+    @Bean
+    public ProducerFactory<String, GeneralUserStatisticDto> userStatisticProducerFactory() {
+        Map<String, Object> configProps = new HashMap<>();
+        configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);
+        configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        configProps.put(JsonSerializer.ADD_TYPE_INFO_HEADERS, false);
+        return new DefaultKafkaProducerFactory<>(configProps);
+    }
+    @Bean
+    public KafkaTemplate<String, GeneralUserStatisticDto> kafkaTemplate() {
+        KafkaTemplate<String, GeneralUserStatisticDto> kafkaTemplate =
+                new KafkaTemplate<>(userStatisticProducerFactory());
+        kafkaTemplate.setObservationEnabled(true);
+        return kafkaTemplate;
+    }
+    @Bean
+    public KafkaAdmin admin() {
+        Map<String, Object> configs = new HashMap<>();
+        configs.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);
+        return new KafkaAdmin(configs);
+    }
+    @Bean
+    public NewTopic generalUserStatisticTopic() {
+        return TopicBuilder.name(KafkaConstants.GENERAL_USER_STATISTIC_TOPIC_NAME)
+                .replicas(AMOUNT_OF_REPLICAS)
+                .partitions(AMOUNT_OF_PARTITIONS)
+                .build();
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/kafka/consumer/averagerating/AverageRatingListener.java
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class AverageRatingListener {
+    private final DriverRepository driverRepository;
+    private final DriverMapper driverMapper;
+    private final MessageSource messageSource;
+    @KafkaListener(
+            topics = KafkaConstants.TOPIC_NAME_AVERAGE_RATING_FROM_RATING_SERVICE,
+            groupId = KafkaConstants.GROUP_ID_AVERAGE_RATING_FROM_RATING_SERVICE,
+            containerFactory = KafkaConstants.BASE_KAFKA_LISTENER_CONTAINER_FACTORY,
+            properties = {KafkaConstants.TARGET_DTO_FOR_DESERIALIZATION_PROPERTY})
+    public void listenToDriverAverageRating(AverageRatingResponseDto averageRatingResponseDto) {
+        Driver driver = driverRepository.findByIdAndDeletedIsFalse(averageRatingResponseDto.refUserId())
+                .orElseThrow(() -> new DriverNotFoundException(messageSource.getMessage(
+                        AppConstants.DRIVER_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{averageRatingResponseDto.refUserId()},
+                        LocaleContextHolder.getLocale())));
+        driverMapper.partialUpdate(averageRatingResponseDto, driver);
+        driverRepository.save(driver);
+        log.info("Received message from driver topic: {}", averageRatingResponseDto);
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/kafka/producer/statistic/StatisticSender.java
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class StatisticSender {
+    private final KafkaTemplate<String, GeneralUserStatisticDto> kafkaGeneralStatisticTemplate;
+    public void sendGeneralUserStatisticToNotificationService(GeneralUserStatisticDto generalUserStatisticDto) {
+        kafkaGeneralStatisticTemplate.send(KafkaConstants.GENERAL_USER_STATISTIC_TOPIC_NAME, generalUserStatisticDto)
+                .whenComplete(StatisticSender::logResult);
+    }
+    private static void logResult(SendResult<String, GeneralUserStatisticDto> result, Throwable exception) {
+        if (exception != null) {
+            log.error("Failed to send message: {}", exception.getMessage());
+        } else {
+            log.info("Message sent successfully to topic: {}, partition: {}, offset: {}",
+                    result.getRecordMetadata().topic(),
+                    result.getRecordMetadata().partition(),
+                    result.getRecordMetadata().offset());
+        }
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/service/impl/AvatarServiceImpl.java
+@Service
+@RequiredArgsConstructor
+public class AvatarServiceImpl implements AvatarService {
+    private final MinioClient minioClient;
+    private final MessageSource messageSource;
+    private final DriverRepository driverRepository;
+    @Value("${minio.bucket.name}")
+    private String bucketName;
+    @Value("${minio.file.types}")
+    private List<String> allowedTypes;
+    @Override
+    @SneakyThrows
+    public MinioFileInformation uploadAvatar(Long id, MultipartFile file) {
+        validateDriverExistence(id);
+        validateFileType(file);
+        InputStream inputStream = file.getInputStream();
+        String newFileName = AvatarServiceLiteralConstants.BASE_DRIVER_AVATAR_NAME + id;
+        minioClient.putObject(
+                PutObjectArgs.builder()
+                        .bucket(bucketName)
+                        .object(newFileName)
+                        .contentType(file.getContentType())
+                        .stream(inputStream, inputStream.available(), -1)
+                        .headers(Map.of(HttpHeaders.CONTENT_DISPOSITION,
+                                AvatarServiceLiteralConstants.CONTENT_DISPOSITION_VALUE))
+                        .build());
+        return getImageAsMinioFileInformation(newFileName);
+    }
+    @Override
+    public MinioFileInformation getAvatar(Long id) {
+        validateDriverExistence(id);
+        return getImageAsMinioFileInformation(AvatarServiceLiteralConstants.BASE_DRIVER_AVATAR_NAME + id);
+    }
+    @Override
+    @SneakyThrows
+    public void deleteAvatar(Long id) {
+        validateDriverExistence(id);
+        String objectName = AvatarServiceLiteralConstants.BASE_DRIVER_AVATAR_NAME + id;
+        try {
+            minioClient.statObject(StatObjectArgs.builder()
+                    .bucket(bucketName)
+                    .object(objectName)
+                    .build());
+            minioClient.removeObject(RemoveObjectArgs.builder()
+                    .bucket(bucketName)
+                    .object(objectName)
+                    .build());
+        } catch (ErrorResponseException e) {
+            throw new NoSuchAvatarException(messageSource.getMessage(
+                    AppConstants.NO_SUCH_AVATAR_MESSAGE_KEY,
+                    new Object[]{objectName},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private void validateFileType(MultipartFile file) {
+        if (!allowedTypes.contains(file.getContentType())) {
+            throw new UnsupportedFileTypeException(messageSource.getMessage(
+                    AppConstants.UNSUPPORTED_FILE_TYPE_MESSAGE_KEY,
+                    new Object[]{file.getOriginalFilename()},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    @SneakyThrows
+    private MinioFileInformation getImageAsMinioFileInformation(String bucketObjectName) {
+        try {
+            StatObjectResponse statObjectResponse = minioClient.statObject(StatObjectArgs.builder()
+                    .bucket(bucketName)
+                    .object(bucketObjectName)
+                    .build());
+            InputStream is = minioClient.getObject(
+                    GetObjectArgs.builder()
+                            .bucket(bucketName)
+                            .object(bucketObjectName)
+                            .build());
+            return MinioFileInformation.builder()
+                    .withIs(is)
+                    .withMediaType(MediaType.valueOf(statObjectResponse.contentType()))
+                    .build();
+        } catch (ErrorResponseException e) {
+            throw new NoSuchAvatarException(messageSource.getMessage(
+                    AppConstants.NO_SUCH_AVATAR_MESSAGE_KEY,
+                    new Object[]{bucketObjectName},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private void validateDriverExistence(Long driverId) {
+        if (!driverRepository.existsById(driverId)) {
+            throw new DriverNotFoundException(messageSource.getMessage(
+                    AppConstants.DRIVER_NOT_FOUND_MESSAGE_KEY,
+                    new Object[]{driverId},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/service/impl/CarServiceImpl.java
+@Service
+@RequiredArgsConstructor
+public class CarServiceImpl implements CarService {
+    private final CarRepository carRepository;
+    private final DriverRepository driverRepository;
+    private final CarMapper carMapper;
+    private final MessageSource messageSource;
+    @Override
+    @Transactional
+    @CachePut(value = AppConstants.CAR_CACHE_VALUE, key = "#result.id()")
+    public CarDto createCar(Long driverId, CarDto carDto) {
+        checkCarRestoreOption(carDto);
+        checkCarExistsByNumber(carDto);
+        Car carEntity = carMapper.toEntity(carDto);
+        carEntity.setDeleted(false);
+        Driver driverEntity = getDriverByIdAndDeletedIsFalse(driverId);
+        driverEntity.setDeleted(false);
+        carEntity.setDriver(driverEntity);
+        driverRepository.save(driverEntity);
+        carRepository.save(carEntity);
+        return carMapper.toDto(carEntity);
+    }
+    @Override
+    @Transactional
+    @CachePut(value = AppConstants.CAR_CACHE_VALUE, key = "#carId")
+    public CarDto updateCarByCarIdAndDriverId(Long carId, Long driverId, CarDto carDto) {
+        checkCarRestoreOption(carDto);
+        checkCarExistsByNumber(carDto);
+        Car carEntity = getCarByIdAndDeletedIsFalse(carId);
+        carMapper.partialUpdate(carDto, carEntity);
+        carEntity.setId(carId);
+        Driver driverEntity = getDriverByIdAndDeletedIsFalse(driverId);
+        carEntity.setDriver(driverEntity);
+        driverRepository.save(driverEntity);
+        carRepository.save(carEntity);
+        return carMapper.toDto(carEntity);
+    }
+    @Override
+    @Transactional
+    @CacheEvict(value = AppConstants.CAR_CACHE_VALUE, key = "#carId")
+    public void safeDeleteCarByCarId(Long carId) {
+        Car carEntity = getCarByIdAndDeletedIsFalse(carId);
+        carEntity.setDeleted(true);
+        carRepository.save(carEntity);
+    }
+    @Override
+    @Cacheable(value = AppConstants.CAR_CACHE_VALUE, key = "#carId")
+    public CarDto getCarById(Long carId) {
+        return carMapper.toDto(getCarByIdAndDeletedIsFalse(carId));
+    }
+    private void checkCarRestoreOption(CarDto carDto) {
+        if (Objects.nonNull(carDto.number()) && carRepository.existsByNumberAndDeletedIsTrue(carDto.number())) {
+            throw new DuplicateCarNumbersException(messageSource.getMessage(
+                    AppConstants.RESTORE_CAR_MESSAGE_KEY,
+                    new Object[]{carDto.number()},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private void checkCarExistsByNumber(CarDto carDto) {
+        if (carRepository.existsByNumberAndDeletedIsFalse(carDto.number())) {
+            throw new DuplicateCarNumbersException(messageSource.getMessage(
+                    AppConstants.CAR_NUMBER_DUPLICATE_MESSAGE_KEY,
+                    new Object[]{carDto.number()},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private Car getCarByIdAndDeletedIsFalse(Long carId) {
+        return carRepository.findByIdAndDeletedIsFalse(carId)
+                .orElseThrow(() -> new CarNotFoundException(messageSource.getMessage(
+                        AppConstants.CAR_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{carId},
+                        LocaleContextHolder.getLocale())));
+    }
+    private Driver getDriverByIdAndDeletedIsFalse(Long driverId) {
+        return driverRepository.findByIdAndDeletedIsFalse(driverId)
+                .orElseThrow(() -> new DriverNotFoundException(messageSource.getMessage(
+                        AppConstants.DRIVER_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{driverId},
+                        LocaleContextHolder.getLocale())));
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/service/impl/DriverServiceImpl.java
+@Service
+@RequiredArgsConstructor
+public class DriverServiceImpl implements DriverService {
+    private final DriverRepository driverRepository;
+    private final MessageSource messageSource;
+    private final DriverMapper driverMapper;
+    private final ListContainerMapper listContainerMapper;
+    @Override
+    @Transactional
+    @CachePut(value = AppConstants.DRIVER_CACHE_VALUE, key = "#result.id()")
+    public DriverDto createDriver(DriverDto driverDto) {
+        checkDriverRestoreOption(driverDto);
+        checkCarExistsByPhoneOrEmail(driverDto);
+        Driver driverEntity = driverMapper.toEntity(driverDto);
+        driverEntity.setDeleted(false);
+        return driverMapper.toDto(driverRepository.save(driverEntity));
+    }
+    @Override
+    public ListContainerResponseDto<DriverDto> getPageDrivers(Integer offset, Integer limit) {
+        Page<DriverDto> driversPageDto = driverRepository
+                .findAllByDeletedIsFalse(PageRequest.of(offset, limit))
+                .map(driverMapper::toDto);
+        return listContainerMapper.toDto(driversPageDto);
+    }
+    @Override
+    @Transactional
+    @CacheEvict(value = AppConstants.DRIVER_CACHE_VALUE, key = "#driverId")
+    public void safeDeleteDriverByDriverId(Long driverId) {
+        Driver driverEntity = getDriverByIdAndDeletedIsFalse(driverId);
+        driverEntity.setDeleted(true);
+        driverRepository.save(driverEntity);
+    }
+    @Override
+    @Transactional
+    @CachePut(value = AppConstants.DRIVER_CACHE_VALUE, key = "#driverId")
+    public DriverDto updateDriverById(Long driverId, DriverDto driverDto) {
+        checkDriverRestoreOption(driverDto);
+        checkCarExistsByPhoneOrEmail(driverDto);
+        Driver driverEntity = getDriverByIdAndDeletedIsFalse(driverId);
+        driverMapper.partialUpdate(driverDto, driverEntity);
+        driverRepository.save(driverEntity);
+        return driverMapper.toDto(driverEntity);
+    }
+    @Override
+    @Cacheable(value = AppConstants.DRIVER_CACHE_VALUE, key = "#driverId")
+    public DriverDto getDriverById(Long driverId) {
+        return driverMapper.toDto(getDriverByIdAndDeletedIsFalse(driverId));
+    }
+    @Override
+    public DriverCarDto getDriverWithCars(Long driverId) {
+        Driver driverEntity = driverRepository.findByIdAndDeletedIsFalse(driverId)
+                .orElseThrow(() -> new DriverNotFoundException(messageSource.getMessage(
+                        AppConstants.DRIVER_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{driverId},
+                        LocaleContextHolder.getLocale())));
+        return driverMapper.toDriverCarDto(driverEntity);
+    }
+    private void checkCarExistsByPhoneOrEmail(DriverDto driverDto) {
+        if (driverRepository.existsByPhoneAndDeletedIsFalse(driverDto.phone())) {
+            throw new DuplicateDriverEmailPhoneException(messageSource.getMessage(
+                    AppConstants.DRIVER_PHONE_DUPLICATE_MESSAGE_KEY,
+                    new Object[]{driverDto.phone()},
+                    LocaleContextHolder.getLocale()));
+        }
+        if (driverRepository.existsByEmailAndDeletedIsFalse(driverDto.email())) {
+            throw new DuplicateDriverEmailPhoneException(messageSource.getMessage(
+                    AppConstants.DRIVER_EMAIL_DUPLICATE_MESSAGE_KEY,
+                    new Object[]{driverDto.email()},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private void checkDriverRestoreOption(DriverDto driverDto) {
+        String driverEmail = driverDto.email();
+        String driverPhone = driverDto.phone();
+        if (Objects.nonNull(driverEmail) && driverRepository.existsByEmailAndDeletedIsTrue(driverEmail)) {
+            throw new DuplicateDriverEmailPhoneException(messageSource.getMessage(
+                    AppConstants.RESTORE_DRIVER_BY_EMAIL_MESSAGE_KEY,
+                    new Object[]{driverEmail},
+                    LocaleContextHolder.getLocale()));
+        }
+        if (Objects.nonNull(driverPhone) && driverRepository.existsByPhoneAndDeletedIsTrue(driverPhone)) {
+            throw new DuplicateDriverEmailPhoneException(messageSource.getMessage(
+                    AppConstants.RESTORE_DRIVER_BY_PHONE_MESSAGE_KEY,
+                    new Object[]{driverPhone},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private Driver getDriverByIdAndDeletedIsFalse(Long driverId) {
+        return driverRepository.findByIdAndDeletedIsFalse(driverId)
+                .orElseThrow(() -> new DriverNotFoundException(messageSource.getMessage(
+                        AppConstants.DRIVER_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{driverId},
+                        LocaleContextHolder.getLocale())));
+    }
+}
+
+// Файл: driver-service/src/main/java/com/modsen/driverservice/service/impl/StatisticReportServiceImpl.java
+@Service
+@RequiredArgsConstructor
+public class StatisticReportServiceImpl implements StatisticReportService {
+    private static final String SCHEDULED_CRON = "0 0 0 1 * ?";
+    private final RideFeignClient rideFeignClient;
+    private final DriverRepository driverRepository;
+    private final DriverMapper driverMapper;
+    private final StatisticSender statisticSender;
+    @Override
+    @Scheduled(cron = SCHEDULED_CRON)
+    public void scheduledSenderStatisticToNotificationService() {
+        List<Driver> drivers = driverRepository.findAllByDeletedIsFalse();
+        drivers.forEach(driver -> {
+            RideStatisticResponseDto rideStatisticResponseDto = rideFeignClient.getRideStatisticForDriver(
+                    driver.getId());
+            GeneralUserStatisticDto generalUserStatisticDto = GeneralUserStatisticDto.builder()
+                    .withRideStatistic(rideStatisticResponseDto)
+                    .withUser(driverMapper.toUserDto(driver))
+                    .withUserType(AppConstants.USER_TYPE)
+                    .build();
+            statisticSender.sendGeneralUserStatisticToNotificationService(generalUserStatisticDto);
+        });
+    }
+}
+
+// Файл: notification-service/src/main/java/com/modsen/notificationservice/kafka/KafkaConstants.java
+@NoArgsConstructor(access = AccessLevel.PRIVATE)
+public final class KafkaConstants {
+    //KafkaConsumerConfig
+    public static final String BOOTSTRAP_SERVERS_FROM_APP_YAML = "${spring.kafka.consumer.bootstrap-servers}";
+    public static final String AUTO_OFFSET_RESET_CONFIG_VALUE = "earliest";
+    public static final String TRUSTED_PACKAGES_VALUE = "*";
+    public static final String BASE_KAFKA_LISTENER_CONTAINER_FACTORY = "kafkaListenerContainerFactory";
+    //GeneralStatisticConsumerConfig
+    public static final String GENERAL_USER_STATISTIC_TOPIC_NAME = "user-statistics-topic";
+    public static final String GROUP_ID_GENERAL_USER_STATISTIC = "notification-consumer";
+    public static final String TARGET_DTO_FOR_DESERIALIZATION_PROPERTY =
+            "spring.json.value.default.type=com.modsen.notificationservice.dto.statistic.GeneralUserStatisticDto";
+}
+
+// Файл: notification-service/src/main/java/com/modsen/notificationservice/kafka/KafkaConsumerConfig.java
+@Configuration
+@EnableKafka
+public class KafkaConsumerConfig {
+    @Value(KafkaConstants.BOOTSTRAP_SERVERS_FROM_APP_YAML)
+    private List<String> bootstrapAddress;
+    @Bean
+    public ConsumerFactory<String, Object> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
+                bootstrapAddress);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, KafkaConstants.AUTO_OFFSET_RESET_CONFIG_VALUE);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+                StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, KafkaConstants.TRUSTED_PACKAGES_VALUE);
+        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+        props.put(JsonDeserializer.REMOVE_TYPE_INFO_HEADERS, true);
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, Object> kafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory<String, Object> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.getContainerProperties().setObservationEnabled(true);
+        factory.setConsumerFactory(consumerFactory());
+        return factory;
+    }
+}
+
+// Файл: notification-service/src/main/java/com/modsen/notificationservice/kafka/consumer/GeneralStatisticListener.java
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class GeneralStatisticListener {
+    private final NotificationService notificationService;
+    @KafkaListener(
+            topics = KafkaConstants.GENERAL_USER_STATISTIC_TOPIC_NAME,
+            groupId = KafkaConstants.GROUP_ID_GENERAL_USER_STATISTIC,
+            containerFactory = KafkaConstants.BASE_KAFKA_LISTENER_CONTAINER_FACTORY,
+            properties = {KafkaConstants.TARGET_DTO_FOR_DESERIALIZATION_PROPERTY})
+    public void listenToDriverAverageRating(GeneralUserStatisticDto generalUserStatisticDto) {
+        log.info("Received message from driver topic: {}", generalUserStatisticDto);
+        notificationService.sendUserStatisticOnEmail(generalUserStatisticDto);
+    }
+}
+
+// Файл: notification-service/src/main/java/com/modsen/notificationservice/props/MailProperties.java
+@Component
+@Getter
+@Setter
+@NoArgsConstructor
+@ConfigurationProperties(prefix = "spring.mail")
+public class MailProperties {
+    private String host;
+    private int port;
+    private String username;
+    private String password;
+    private Properties properties;
+}
+
+// Файл: notification-service/src/main/java/com/modsen/notificationservice/service/impl/NotificationServiceImpl.java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class NotificationServiceImpl implements NotificationService {
+    private final JavaMailSender mailSender;
+    private final ResourceLoader resourceLoader;
+    @Override
+    public void sendUserStatisticOnEmail(GeneralUserStatisticDto generalUserStatisticDto) {
+        try {
+            MimeMessage mimeMessage = mailSender.createMimeMessage();
+            MimeMessageHelper mimeMessageHelper = new MimeMessageHelper(mimeMessage, true, "UTF-8");
+            mimeMessageHelper.setTo(generalUserStatisticDto.user().email());
+            mimeMessageHelper.setSubject(AppConstants.MAIL_SUBJECT);
+            mimeMessageHelper.setText(buildHtmlGreetingText(generalUserStatisticDto)
+                    .orElseThrow(() -> new IOException(AppConstants.NULL_HTML_STRING_EXCEPTION_MESSAGE)), true);
+            String htmlReport = buildReportAsStringForPdf(generalUserStatisticDto);
+            ByteArrayOutputStream pdfStream = generatePdf(htmlReport);
+            mimeMessageHelper.addAttachment(AppConstants.REPORT_FILE_NAME,
+                    new ByteArrayDataSource(pdfStream.toByteArray(), AppConstants.PDF_ATTACHMENT_TYPE));
+            mailSender.send(mimeMessage);
+        } catch (Exception e) {
+            log.error(e.getMessage(), e);
+        }
+    }
+    private Optional<String> buildHtmlGreetingText(GeneralUserStatisticDto generalUserStatisticDto) throws IOException {
+        String template = new String(FileCopyUtils.copyToByteArray(
+                resourceLoader.getResource(AppConstants.GREETING_TEXT_CLASSPATH).getInputStream()),
+                StandardCharsets.UTF_8);
+        return Optional.of(template.replace("{{fullName}}", generalUserStatisticDto.user().firstName()
+                + " " + generalUserStatisticDto.user().lastName()));
+    }
+    private String buildReportAsStringForPdf(GeneralUserStatisticDto generalUserStatisticDto) throws IOException {
+        String template = new String(FileCopyUtils.copyToByteArray(
+                resourceLoader.getResource(AppConstants.REPORT_TEXT_CLASSPATH).getInputStream()),
+                StandardCharsets.UTF_8);
+        String ridesHtml = generalUserStatisticDto.rideStatistic().rides().stream()
+                .map(this::buildRideRow)
+                .collect(Collectors.joining());
+        return template.replace("{{firstName}}", generalUserStatisticDto.user().firstName())
+                .replace("{{lastName}}", generalUserStatisticDto.user().lastName())
+                .replace("{{userType}}", generalUserStatisticDto.userType())
+                .replace("{{averageRating}}", String.valueOf(generalUserStatisticDto.user().averageRating()))
+                .replace("{{rides}}", ridesHtml)
+                .replace("{{averageRideCost}}",
+                        String.valueOf(generalUserStatisticDto.rideStatistic().averageCost()));
+    }
+    private String buildRideRow(RideResponseDto ride) {
+        return "<tr>"
+                + "<td>" + ride.id() + "</td>"
+                + "<td>" + ride.driverId() + "</td>"
+                + "<td>" + ride.passengerId() + "</td>"
+                + "<td>" + ride.departureAddress() + "</td>"
+                + "<td>" + ride.destinationAddress() + "</td>"
+                + "<td>" + ride.rideStatus() + "</td>"
+                + "<td>" + ride.orderDateTime() + "</td>"
+                + "<td>" + ride.cost() + "</td>"
+                + "</tr>";
+    }
+    private ByteArrayOutputStream generatePdf(String htmlContent) {
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        ITextRenderer renderer = new ITextRenderer();
+        renderer.setDocumentFromString(htmlContent);
+        renderer.layout();
+        renderer.createPDF(outputStream);
+        return outputStream;
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/aspect/ValidateAccessToResources.java
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface ValidateAccessToResources {
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/aspect/ValidateAccessToResourcesAspect.java
+@Aspect
+@Component
+@RequiredArgsConstructor
+public class ValidateAccessToResourcesAspect {
+    private final PassengerService passengerService;
+    private static final String ROLE_ADMIN_VALUE = "ROLE_ADMIN";
+    private static final String EMAIL_CLAIM = "email";
+    private static final String DEFAULT_ACCESS_DENIED_MESSAGE = "Access denied";
+    @Around("@annotation(com.modsen.passengerservice.aspect.ValidateAccessToResources)")
+    public Object hasPermission(ProceedingJoinPoint joinPoint) throws Throwable {
+        Object[] args = joinPoint.getArgs();
+        JwtAuthenticationToken token = (JwtAuthenticationToken) args[args.length - 1];
+        Long userId = (Long) args[0];
+        if (token.getAuthorities().stream()
+                .filter(Objects::nonNull)
+                .anyMatch(authority -> authority.getAuthority()
+                        .equals(ROLE_ADMIN_VALUE))) {
+            return joinPoint.proceed();
+        }
+        if (!Objects.equals(passengerService.getPassengerById(userId).email(),
+                token.getToken().getClaims().get(EMAIL_CLAIM))) {
+            throw new AccessToResourcesDeniedException(DEFAULT_ACCESS_DENIED_MESSAGE);
+        }
+        return joinPoint.proceed();
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/controller/impl/AvatarController.java
+@RestController
+@RequiredArgsConstructor
+@RequestMapping("/api/v1/passengers")
+public class AvatarController implements AvatarOperations {
+    private final AvatarService avatarService;
+    @Override
+    @PostMapping("/{id}/avatars/upload")
+    @PreAuthorize("hasRole('ADMIN') or hasRole('DRIVER')")
+    @ValidateAccessToResources
+    public ResponseEntity<InputStreamResource> uploadAvatar(@PathVariable("id") Long id, @RequestParam("file") MultipartFile file,
+                                                            JwtAuthenticationToken jwtAuthenticationToken) {
+        MinioFileInformation minioFileInformation = avatarService.uploadAvatar(id, file);
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .header(HttpHeaders.CONTENT_DISPOSITION, AvatarServiceLiteralConstants.CONTENT_DISPOSITION_VALUE)
+                .contentType(minioFileInformation.mediaType())
+                .body(new InputStreamResource(minioFileInformation.is()));
+    }
+    @Override
+    @GetMapping("/{id}/avatars")
+    public ResponseEntity<InputStreamResource> getAvatar(@PathVariable("id") Long id) {
+        MinioFileInformation minioFileInformation = avatarService.getAvatar(id);
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION, AvatarServiceLiteralConstants.CONTENT_DISPOSITION_VALUE)
+                .contentType(minioFileInformation.mediaType())
+                .body(new InputStreamResource(minioFileInformation.is()));
+    }
+    @Override
+    @DeleteMapping("/{id}/avatars")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("hasRole('ADMIN') or hasRole('DRIVER')")
+    @ValidateAccessToResources
+    public void deleteAvatar(@PathVariable("id") Long id, JwtAuthenticationToken jwtAuthenticationToken) {
+        avatarService.deleteAvatar(id);
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/controller/impl/PassengerController.java
+@RestController
+@RequestMapping("/api/v1/passengers")
+@RequiredArgsConstructor
+public class PassengerController implements PassengerOperations {
+    private final PassengerService passengerService;
+    @Override
+    @PostMapping
+    @PreAuthorize("hasRole('ADMIN')")
+    @ResponseStatus(HttpStatus.CREATED)
+    public PassengerDto createPassenger(@RequestBody @Valid PassengerDto passengerDto) {
+        return passengerService.createPassenger(passengerDto);
+    }
+    @Override
+    @GetMapping
+    public ListContainerResponseDto<PassengerDto> getPagePassengers(
+            @RequestParam(defaultValue = "0") @Min(0) Integer offset,
+            @RequestParam(defaultValue = "10") @Min(1) @Max(100) Integer limit) {
+        return passengerService.getPagePassengers(offset, limit);
+    }
+    @Override
+    @DeleteMapping("/{passengerId}")
+    @PreAuthorize("hasRole('ADMIN') or hasRole('PASSENGER')")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @ValidateAccessToResources
+    public void safeDeletePassenger(@PathVariable Long passengerId, JwtAuthenticationToken token) {
+        passengerService.safeDeletePassengerById(passengerId);
+    }
+    @Override
+    @PreAuthorize("hasRole('ADMIN') or hasRole('PASSENGER')")
+    @PutMapping("/{passengerId}")
+    @ValidateAccessToResources
+    public PassengerDto updatePassengerById(@PathVariable Long passengerId,
+                                            @RequestBody @Valid PassengerDto passengerDto,
+                                            JwtAuthenticationToken token) {
+        return passengerService.updatePassengerById(passengerId, passengerDto);
+    }
+    @Override
+    @GetMapping("/{passengerId}")
+    public PassengerDto getPassengerById(@PathVariable Long passengerId) {
+        return passengerService.getPassengerById(passengerId);
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/exception/GlobalExceptionHandler.java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+    @ExceptionHandler({PassengerNotFoundException.class})
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ApiExceptionDto handleNotFoundException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.NOT_FOUND, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler({DuplicatePassengerPhoneOrEmailException.class})
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ApiExceptionDto handleDuplicateException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.CONFLICT, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    @ResponseStatus(HttpStatus.PAYLOAD_TOO_LARGE)
+    public ApiExceptionDto handleMaxUploadSizeExceededException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.PAYLOAD_TOO_LARGE, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(UnsupportedFileTypeException.class)
+    @ResponseStatus(HttpStatus.UNSUPPORTED_MEDIA_TYPE)
+    public ApiExceptionDto handleUnsupportedFileTypeException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.UNSUPPORTED_MEDIA_TYPE, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(NoSuchAvatarException.class)
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ApiExceptionDto handleNoSuchAvatarException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.NOT_FOUND, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(MultipartException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ApiExceptionDto handleMultipartException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.BAD_REQUEST, e.getMessage(), LocalDateTime.now());
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/exception/avatar/NoSuchAvatarException.java
+public class NoSuchAvatarException extends RuntimeException {
+    public NoSuchAvatarException(String message) {
+        super(message);
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/exception/avatar/UnsupportedFileTypeException.java
+public class UnsupportedFileTypeException extends RuntimeException {
+    public UnsupportedFileTypeException(String message) {
+        super(message);
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/exception/passenger/DuplicatePassengerPhoneOrEmailException.java
+public class DuplicatePassengerPhoneOrEmailException extends RuntimeException {
+    public DuplicatePassengerPhoneOrEmailException(String message) {
+        super(message);
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/exception/passenger/PassengerNotFoundException.java
+public class PassengerNotFoundException extends RuntimeException {
+    public PassengerNotFoundException(String message) {
+        super(message);
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/kafka/KafkaConstants.java
+@NoArgsConstructor(access = AccessLevel.PRIVATE)
+public final class KafkaConstants {
+    //KafkaConsumerConfig
+    public static final String BOOTSTRAP_SERVERS_FROM_APP_YAML = "${spring.kafka.consumer.bootstrap-servers}";
+    public static final String AUTO_OFFSET_RESET_CONFIG_VALUE = "earliest";
+    public static final String TRUSTED_PACKAGES_VALUE = "*";
+    //AverageRatingListener
+    public static final String TOPIC_NAME_AVERAGE_RATING_FROM_RATING_SERVICE = "passenger-average-rating-topic";
+    public static final String GROUP_ID_AVERAGE_RATING_FROM_RATING_SERVICE = "passenger-consumer";
+    public static final String TARGET_DTO_FOR_DESERIALIZATION_PROPERTY =
+            "spring.json.value.default.type=com.modsen.passengerservice.dto.AverageRatingResponseDto";
+    //Common
+    public static final String BASE_KAFKA_LISTENER_CONTAINER_FACTORY = "kafkaListenerContainerFactory";
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/kafka/KafkaConsumerConfig.java
+@Configuration
+@EnableKafka
+public class KafkaConsumerConfig {
+    @Value(KafkaConstants.BOOTSTRAP_SERVERS_FROM_APP_YAML)
+    private List<String> bootstrapAddress;
+    @Bean
+    public ConsumerFactory<String, Object> consumerFactory() {
+        Map<String, Object> props = new HashMap<>();
+        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG,
+                bootstrapAddress);
+        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, KafkaConstants.AUTO_OFFSET_RESET_CONFIG_VALUE);
+        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+                StringDeserializer.class);
+        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, JsonDeserializer.class);
+        props.put(JsonDeserializer.TRUSTED_PACKAGES, KafkaConstants.TRUSTED_PACKAGES_VALUE);
+        props.put(JsonDeserializer.USE_TYPE_INFO_HEADERS, false);
+        props.put(JsonDeserializer.REMOVE_TYPE_INFO_HEADERS, true);
+        return new DefaultKafkaConsumerFactory<>(props);
+    }
+    @Bean
+    public ConcurrentKafkaListenerContainerFactory<String, Object> kafkaListenerContainerFactory() {
+        ConcurrentKafkaListenerContainerFactory<String, Object> factory =
+                new ConcurrentKafkaListenerContainerFactory<>();
+        factory.getContainerProperties().setObservationEnabled(true);
+        factory.setConsumerFactory(consumerFactory());
+        return factory;
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/kafka/consumer/averagerating/AverageRatingListener.java
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class AverageRatingListener {
+    private final PassengerRepository passengerRepository;
+    private final PassengerMapper passengerMapper;
+    private final MessageSource messageSource;
+    @KafkaListener(
+            topics = KafkaConstants.TOPIC_NAME_AVERAGE_RATING_FROM_RATING_SERVICE,
+            groupId = KafkaConstants.GROUP_ID_AVERAGE_RATING_FROM_RATING_SERVICE,
+            containerFactory = KafkaConstants.BASE_KAFKA_LISTENER_CONTAINER_FACTORY,
+            properties = {KafkaConstants.TARGET_DTO_FOR_DESERIALIZATION_PROPERTY})
+    public void listenToDriverAverageRating(AverageRatingResponseDto averageRatingResponseDto) {
+        Passenger passenger = passengerRepository.findByIdAndDeletedIsFalse(averageRatingResponseDto.refUserId())
+                .orElseThrow(() -> new PassengerNotFoundException(messageSource.getMessage(
+                        AppConstants.PASSENGER_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{averageRatingResponseDto.refUserId()},
+                        LocaleContextHolder.getLocale())));
+        passengerMapper.partialUpdate(averageRatingResponseDto, passenger);
+        passengerRepository.save(passenger);
+        log.info("Received message from driver topic: {}", averageRatingResponseDto);
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/service/impl/AvatarServiceImpl.java
+@Service
+@RequiredArgsConstructor
+public class AvatarServiceImpl implements AvatarService {
+    private final MinioClient minioClient;
+    private final MessageSource messageSource;
+    private final PassengerRepository passengerRepository;
+    @Value("${minio.bucket.name}")
+    private String bucketName;
+    @Value("${minio.file.types}")
+    private List<String> allowedTypes;
+    @Override
+    @SneakyThrows
+    public MinioFileInformation uploadAvatar(Long id, MultipartFile file) {
+        validateDriverExistence(id);
+        validateFileType(file);
+        InputStream inputStream = file.getInputStream();
+        String newFileName = AvatarServiceLiteralConstants.BASE_PASSENGER_AVATAR_NAME + id;
+        minioClient.putObject(
+                PutObjectArgs.builder()
+                        .bucket(bucketName)
+                        .object(newFileName)
+                        .contentType(file.getContentType())
+                        .stream(inputStream, inputStream.available(), -1)
+                        .headers(Map.of(HttpHeaders.CONTENT_DISPOSITION,
+                                AvatarServiceLiteralConstants.CONTENT_DISPOSITION_VALUE))
+                        .build());
+        return getImageAsMinioFileInformation(newFileName);
+    }
+    @Override
+    public MinioFileInformation getAvatar(Long id) {
+        validateDriverExistence(id);
+        return getImageAsMinioFileInformation(AvatarServiceLiteralConstants.BASE_PASSENGER_AVATAR_NAME + id);
+    }
+    @Override
+    @SneakyThrows
+    public void deleteAvatar(Long id) {
+        validateDriverExistence(id);
+        String objectName = AvatarServiceLiteralConstants.BASE_PASSENGER_AVATAR_NAME + id;
+        try {
+            minioClient.statObject(StatObjectArgs.builder()
+                    .bucket(bucketName)
+                    .object(objectName)
+                    .build());
+            minioClient.removeObject(RemoveObjectArgs.builder()
+                    .bucket(bucketName)
+                    .object(objectName)
+                    .build());
+        } catch (ErrorResponseException e) {
+            throw new NoSuchAvatarException(messageSource.getMessage(
+                    AppConstants.NO_SUCH_AVATAR_MESSAGE_KEY,
+                    new Object[]{objectName},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private void validateFileType(MultipartFile file) {
+        if (!allowedTypes.contains(file.getContentType())) {
+            throw new UnsupportedFileTypeException(messageSource.getMessage(
+                    AppConstants.UNSUPPORTED_FILE_TYPE_MESSAGE_KEY,
+                    new Object[]{file.getOriginalFilename()},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    @SneakyThrows
+    private MinioFileInformation getImageAsMinioFileInformation(String bucketObjectName) {
+        try {
+            StatObjectResponse statObjectResponse = minioClient.statObject(StatObjectArgs.builder()
+                    .bucket(bucketName)
+                    .object(bucketObjectName)
+                    .build());
+            InputStream is = minioClient.getObject(
+                    GetObjectArgs.builder()
+                            .bucket(bucketName)
+                            .object(bucketObjectName)
+                            .build());
+            return MinioFileInformation.builder()
+                    .withIs(is)
+                    .withMediaType(MediaType.valueOf(statObjectResponse.contentType()))
+                    .build();
+        } catch (ErrorResponseException e) {
+            throw new NoSuchAvatarException(messageSource.getMessage(
+                    AppConstants.NO_SUCH_AVATAR_MESSAGE_KEY,
+                    new Object[]{bucketObjectName},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private void validateDriverExistence(Long driverId) {
+        if (!passengerRepository.existsById(driverId)) {
+            throw new PassengerNotFoundException(messageSource.getMessage(
+                    AppConstants.PASSENGER_NOT_FOUND_MESSAGE_KEY,
+                    new Object[]{driverId},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+}
+
+// Файл: passenger-service/src/main/java/com/modsen/passengerservice/service/impl/PassengerServiceImpl.java
+@Service
+@RequiredArgsConstructor
+public class PassengerServiceImpl implements PassengerService {
+    private final PassengerRepository passengerRepository;
+    private final PassengerMapper passengerMapper;
+    private final ListContainerMapper listContainerMapper;
+    private final MessageSource messageSource;
+    @Override
+    @Transactional
+    @CachePut(value = AppConstants.PASSENGER_CACHE_VALUE, key = "#result.id()")
+    public PassengerDto createPassenger(PassengerDto passengerDto) {
+        checkPassengerExistsByPhoneOrEmail(passengerDto);
+        checkPassengerRestoreOption(passengerDto);
+        Passenger passenger = passengerMapper.toEntity(passengerDto);
+        passenger.setDeleted(false);
+        passengerRepository.save(passenger);
+        return passengerMapper.toDto(passenger);
+    }
+    @Override
+    public ListContainerResponseDto<PassengerDto> getPagePassengers(Integer offset, Integer limit) {
+        Page<PassengerDto> passengersPageDto = passengerRepository
+                .findAllByDeletedIsFalse(PageRequest.of(offset, limit))
+                .map(passengerMapper::toDto);
+        return listContainerMapper.toDto(passengersPageDto);
+    }
+    @Override
+    @Transactional
+    @CacheEvict(value = AppConstants.PASSENGER_CACHE_VALUE, key = "#passengerId")
+    public void safeDeletePassengerById(Long passengerId) {
+        Passenger passenger = getPassengerByIdAndDeletedIsFalse(passengerId);
+        passenger.setDeleted(true);
+        passengerRepository.save(passenger);
+    }
+    @Override
+    @Transactional
+    @CachePut(value = AppConstants.PASSENGER_CACHE_VALUE, key = "#result.id()")
+    public PassengerDto updatePassengerById(Long passengerId, PassengerDto passengerDto) {
+        checkPassengerRestoreOption(passengerDto);
+        checkPassengerExistsByPhoneOrEmail(passengerDto);
+        Passenger passenger = getPassengerByIdAndDeletedIsFalse(passengerId);
+        passengerMapper.partialUpdate(passengerDto, passenger);
+        passenger.setDeleted(false);
+        passengerRepository.save(passenger);
+        return passengerMapper.toDto(passenger);
+    }
+    @Override
+    @Cacheable(value = AppConstants.PASSENGER_CACHE_VALUE, key = "#passengerId")
+    public PassengerDto getPassengerById(Long passengerId) {
+        return passengerMapper.toDto(getPassengerByIdAndDeletedIsFalse(passengerId));
+    }
+    private void checkPassengerExistsByPhoneOrEmail(PassengerDto passengerDto) {
+        String passengerEmail = passengerDto.email();
+        if (Objects.nonNull(passengerEmail) && passengerRepository.existsByEmailAndDeletedIsFalse(passengerEmail)) {
+            throw new DuplicatePassengerPhoneOrEmailException(messageSource.getMessage(
+                    AppConstants.PASSENGER_EMAIL_DUPLICATE_MESSAGE_KEY,
+                    new Object[]{passengerEmail},
+                    LocaleContextHolder.getLocale()
+            ));
+        }
+        String passengerPhone = passengerDto.phone();
+        if (Objects.nonNull(passengerPhone) && passengerRepository.existsByPhoneAndDeletedIsFalse(passengerPhone)) {
+            throw new DuplicatePassengerPhoneOrEmailException(messageSource.getMessage(
+                    AppConstants.PASSENGER_PHONE_DUPLICATE_MESSAGE_KEY,
+                    new Object[]{passengerPhone},
+                    LocaleContextHolder.getLocale()
+            ));
+        }
+    }
+    private void checkPassengerRestoreOption(PassengerDto passengerDto) {
+        String passengerEmail = passengerDto.email();
+        if (Objects.nonNull(passengerEmail) && passengerRepository.existsByEmailAndDeletedIsTrue(passengerEmail)) {
+            throw new DuplicatePassengerPhoneOrEmailException(messageSource.getMessage(
+                    AppConstants.RESTORE_PASSENGER_BY_EMAIL_MESSAGE_KEY,
+                    new Object[]{passengerEmail},
+                    LocaleContextHolder.getLocale()
+            ));
+        }
+        String passengerPhone = passengerDto.phone();
+        if (Objects.nonNull(passengerPhone) && passengerRepository.existsByPhoneAndDeletedIsTrue(passengerPhone)) {
+            throw new DuplicatePassengerPhoneOrEmailException(messageSource.getMessage(
+                    AppConstants.RESTORE_PASSENGER_BY_PHONE_MESSAGE_KEY,
+                    new Object[]{passengerPhone},
+                    LocaleContextHolder.getLocale()
+            ));
+        }
+    }
+    private Passenger getPassengerByIdAndDeletedIsFalse(Long passengerId) {
+        return passengerRepository.findByIdAndDeletedIsFalse(passengerId)
+                .orElseThrow(() -> new PassengerNotFoundException(messageSource.getMessage(
+                        AppConstants.PASSENGER_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{passengerId},
+                        LocaleContextHolder.getLocale()
+                )));
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/client/RideFeignClientErrorDecoder.java
+@Component
+public class RideFeignClientErrorDecoder implements ErrorDecoder {
+    @Override
+    @SneakyThrows
+    public Exception decode(String s, Response response) {
+        ObjectMapper objectMapper = new ObjectMapper();
+        objectMapper.registerModule(new JavaTimeModule());
+        ApiExceptionDto apiExceptionDto;
+        apiExceptionDto = objectMapper.readValue(readResponseBody(response), ApiExceptionDto.class);
+        return new RideFeignClientException(apiExceptionDto);
+    }
+    @SneakyThrows
+    private String readResponseBody(Response response) {
+        if (Objects.nonNull(response.body())) {
+            StringBuilder builder = new StringBuilder();
+            @Cleanup InputStreamReader inputStreamReader = new InputStreamReader(response.body()
+                    .asInputStream(), StandardCharsets.UTF_8);
+            BufferedReader reader = new BufferedReader(inputStreamReader);
+            String line;
+            while ((line = reader.readLine()) != null) {
+                builder.append(line);
+            }
+            return builder.toString();
+        }
+        return "";
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/client/RideFeignClientException.java
+@Getter
+public class RideFeignClientException extends RuntimeException {
+    private final ApiExceptionDto apiExceptionDto;
+    public RideFeignClientException(ApiExceptionDto apiExceptionDto) {
+        this.apiExceptionDto = apiExceptionDto;
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/controller/impl/DriverRatingController.java
+@RestController
+@RequestMapping("/api/v1/drivers-ratings")
+@RequiredArgsConstructor
+public class DriverRatingController implements DriverRatingOperations {
+    private final DriverRatingService driverRatingService;
+    @Override
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    @PreAuthorize("hasRole('ADMIN') or hasRole('DRIVER')")
+    @CachePut(value = AppConstants.DRIVER_RATING_CACHE_VALUE, key = "#result.id()")
+    public RatingResponseDto createDriverRating(@Valid @RequestBody RatingRequestDto ratingRequestDto) {
+        return driverRatingService.createRating(ratingRequestDto);
+    }
+    @Override
+    @PutMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    @CachePut(value = AppConstants.DRIVER_RATING_CACHE_VALUE, key ="#result.id()")
+    public RatingResponseDto updateDriverRating(@PathVariable Long id,
+                                                @Valid @RequestBody RatingRequestDto ratingRequestDto) {
+        return driverRatingService.updateRatingById(id, ratingRequestDto);
+    }
+    @Override
+    @GetMapping("/{id}")
+    @Cacheable(value = AppConstants.DRIVER_RATING_CACHE_VALUE, key = "#id")
+    public RatingResponseDto getDriverRating(@PathVariable Long id) {
+        return driverRatingService.getRating(id);
+    }
+    @Override
+    @GetMapping("/users/{refUserId}")
+    public ListContainerResponseDto<RatingResponseDto> getDriverRatingsByRefUserId(@PathVariable Long refUserId,
+                                                                                   @RequestParam(defaultValue = "0")
+                                                                                   @Min(0) Integer offset,
+                                                                                   @RequestParam(defaultValue = "10")
+                                                                                   @Min(1) @Max(100) Integer limit) {
+        return driverRatingService.getRatingsByRefUserId(refUserId, offset, limit);
+    }
+    @Override
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("hasRole('ADMIN')")
+    @CacheEvict(value = AppConstants.DRIVER_RATING_CACHE_VALUE, key = "#id")
+    public void deleteDriverRating(@PathVariable Long id) {
+        driverRatingService.safeDeleteRating(id);
+    }
+    @Override
+    @GetMapping("/{refUserId}/average")
+    @Cacheable(value = AppConstants.AVERAGE_DRIVER_RATING_CACHE_VALUE, key = "#refUserId")
+    public AverageRatingResponseDto averageDriverRating(@PathVariable Long refUserId) {
+        return driverRatingService.getAverageRating(refUserId);
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/controller/impl/PassengerRatingController.java
+@RestController
+@RequestMapping("/api/v1/passengers-ratings")
+@RequiredArgsConstructor
+public class PassengerRatingController implements PassengerRatingOperations {
+    private final PassengerRatingService passengerRatingService;
+    @Override
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    @PreAuthorize("hasRole('ADMIN') or hasRole('PASSENGER')")
+    @CachePut(value = AppConstants.PASSENGER_RATING_CACHE_VALUE, key = "#result.id()")
+    public RatingResponseDto createPassengerRating(@Valid @RequestBody RatingRequestDto ratingRequestDto) {
+        return passengerRatingService.createRating(ratingRequestDto);
+    }
+    @Override
+    @PutMapping("/{id}")
+    @PreAuthorize("hasRole('ADMIN')")
+    @CachePut(value = AppConstants.PASSENGER_RATING_CACHE_VALUE, key = "#result.id()")
+    public RatingResponseDto updatePassengerRating(@PathVariable Long id,
+                                                   @Valid @RequestBody RatingRequestDto ratingRequestDto) {
+        return passengerRatingService.updateRatingById(id, ratingRequestDto);
+    }
+    @Override
+    @GetMapping("/{id}")
+    @Cacheable(value = AppConstants.PASSENGER_RATING_CACHE_VALUE, key = "#id")
+    public RatingResponseDto getPassengerRating(@PathVariable Long id) {
+        return passengerRatingService.getRating(id);
+    }
+    @Override
+    @GetMapping("/users/{refUserId}")
+    public ListContainerResponseDto<RatingResponseDto> getPassengerRatingsByRefUserId(@PathVariable Long refUserId,
+                                                                                      @RequestParam(defaultValue = "0")
+                                                                                      @Min(0) Integer offset,
+                                                                                      @RequestParam(defaultValue = "10")
+                                                                                      @Min(1) @Max(100) Integer limit) {
+        return passengerRatingService.getRatingsByRefUserId(refUserId, offset, limit);
+    }
+    @Override
+    @DeleteMapping("/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    @PreAuthorize("hasRole('ADMIN')")
+    @CacheEvict(value = AppConstants.PASSENGER_RATING_CACHE_VALUE, key = "#id")
+    public void deletePassengerRating(@PathVariable Long id) {
+        passengerRatingService.safeDeleteRating(id);
+    }
+    @Override
+    @GetMapping("/{refUserId}/average")
+    @Cacheable(value = AppConstants.AVERAGE_PASSENGER_RATING_CACHE_VALUE, key = "#refUserId")
+    public AverageRatingResponseDto averagePassengerRating(@PathVariable Long refUserId) {
+        return passengerRatingService.getAverageRating(refUserId);
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/exception/GlobalExceptionHandler.java
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    @ExceptionHandler({RatingNotFoundException.class, RefUserIdNotFoundException.class})
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ApiExceptionDto handleNotFoundException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.NOT_FOUND, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(DuplicateRideIdException.class)
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ApiExceptionDto handleDuplicateException(Exception e) {
+        return new ApiExceptionDto(HttpStatus.CONFLICT, e.getMessage(), LocalDateTime.now());
+    }
+    @ExceptionHandler(RideFeignClientException.class)
+    public ResponseEntity<ApiExceptionDto> handleRideNotFoundException(RideFeignClientException e) {
+        ApiExceptionDto exceptionDto = e.getApiExceptionDto();
+        return ResponseEntity.status(exceptionDto.getStatus()).body(e.getApiExceptionDto());
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/exception/rating/DuplicateRideIdException.java
+public class DuplicateRideIdException extends RuntimeException {
+    public DuplicateRideIdException(String message) {
+        super(message);
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/exception/rating/RatingNotFoundException.java
+public class RatingNotFoundException extends RuntimeException {
+    public RatingNotFoundException(String message) {
+        super(message);
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/exception/rating/RefUserIdNotFoundException.java
+public class RefUserIdNotFoundException extends RuntimeException {
+    public RefUserIdNotFoundException(String message) {
+        super(message);
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/kafka/KafkaConstants.java
+public class KafkaConstants {
+    public static final String DRIVER_TOPIC_NAME = "driver-average-rating-topic";
+    public static final String PASSENGER_TOPIC_NAME = "passenger-average-rating-topic";
+    public static final String BOOTSTRAP_ADDRESS_FROM_YAML = "${spring.kafka.producer.bootstrap-servers}";
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/kafka/KafkaProducerConfig.java
+@Configuration
+public class KafkaProducerConfig {
+    private static final int AMOUNT_OF_REPLICAS = 3;
+    private static final int AMOUNT_OF_PARTITIONS = 3;
+    @Value(KafkaConstants.BOOTSTRAP_ADDRESS_FROM_YAML)
+    private List<String> bootstrapAddress;
+    @Bean
+    public ProducerFactory<String, AverageRatingResponseDto> producerFactory() {
+        Map<String, Object> configProps = new HashMap<>();
+        configProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);
+        configProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        configProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, JsonSerializer.class);
+        configProps.put(JsonSerializer.ADD_TYPE_INFO_HEADERS, false);
+        return new DefaultKafkaProducerFactory<>(configProps);
+    }
+    @Bean
+    public KafkaTemplate<String, AverageRatingResponseDto> kafkaTemplate() {
+        KafkaTemplate<String, AverageRatingResponseDto> kafkaTemplate = new KafkaTemplate<>(producerFactory());
+        kafkaTemplate.setObservationEnabled(true);
+        return kafkaTemplate;
+    }
+    @Bean
+    public KafkaAdmin admin() {
+        Map<String, Object> configs = new HashMap<>();
+        configs.put(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapAddress);
+        return new KafkaAdmin(configs);
+    }
+    @Bean
+    public NewTopic driverAverageRatingTopic() {
+        return TopicBuilder.name(KafkaConstants.DRIVER_TOPIC_NAME)
+                .replicas(AMOUNT_OF_REPLICAS)
+                .partitions(AMOUNT_OF_PARTITIONS)
+                .build();
+    }
+    @Bean
+    public NewTopic passengerAverageRatingTopic() {
+        return TopicBuilder.name(KafkaConstants.PASSENGER_TOPIC_NAME)
+                .replicas(AMOUNT_OF_REPLICAS)
+                .partitions(AMOUNT_OF_PARTITIONS)
+                .build();
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/kafka/producer/AverageRatingSender.java
+@Component
+@Slf4j
+@RequiredArgsConstructor
+public class AverageRatingSender {
+    private final KafkaTemplate<String, AverageRatingResponseDto> kafkaAverageRatingTemplate;
+    public void sendAverageRatingToDriver(AverageRatingResponseDto averageRatingResponseDto) {
+        kafkaAverageRatingTemplate.send(KafkaConstants.DRIVER_TOPIC_NAME, averageRatingResponseDto)
+                .whenComplete(AverageRatingSender::logResult);
+    }
+    public void sendAverageRatingToPassenger(AverageRatingResponseDto averageRatingResponseDto) {
+        kafkaAverageRatingTemplate.send(KafkaConstants.PASSENGER_TOPIC_NAME, averageRatingResponseDto)
+                .whenComplete(AverageRatingSender::logResult);
+    }
+    private static void logResult(SendResult<String, AverageRatingResponseDto> result, Throwable exception) {
+        if (exception != null) {
+            log.error("Failed to send message: {}", exception.getMessage());
+        } else {
+            log.info("Message sent successfully to topic: {}, partition: {}, offset: {}",
+                    result.getRecordMetadata().topic(),
+                    result.getRecordMetadata().partition(),
+                    result.getRecordMetadata().offset());
+        }
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/service/general/AbstractRatingService.java
+@AllArgsConstructor
+public class AbstractRatingService<T extends Rating, R extends CommonRatingRepository<T>>
+        implements CommonRatingService<T> {
+    protected final R repository;
+    protected final BaseRatingMapper<T> ratingMapper;
+    protected final ListContainerMapper listContainerMapper;
+    protected final MessageSource messageSource;
+    protected final RideFeignClient rideFeignClient;
+    protected final AverageRatingSender averageRatingSender;
+    private String userType;
+    @Override
+    @Transactional
+    public RatingResponseDto createRating(RatingRequestDto ratingRequestDto) {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        JwtAuthenticationToken token = (JwtAuthenticationToken) authentication;
+        RideResponseDto rideResponseDto = rideFeignClient
+                .findRideById(ratingRequestDto.rideId(), LocaleContextHolder.getLocale().toLanguageTag(),
+                        "Bearer " + token.getToken().getTokenValue());
+        checkRatingExistsByRideId(ratingRequestDto);
+        checkRatingRestoreOption(ratingRequestDto);
+        T rating = ratingMapper.toRating(ratingRequestDto);
+        setRefUserIdBasedOnUserType(rating, rideResponseDto);
+        rating.setDeleted(false);
+        repository.save(rating);
+        return ratingMapper.toDto(rating, userType);
+    }
+    @Override
+    @Transactional
+    public RatingResponseDto updateRatingById(Long id, RatingRequestDto ratingRequestDto) {
+        checkRatingRestoreOption(ratingRequestDto);
+        checkRatingExistsByRideId(ratingRequestDto);
+        T rating = getRatingWithHandlingException(id);
+        ratingMapper.partialUpdate(ratingRequestDto, rating);
+        repository.save(rating);
+        return ratingMapper.toDto(rating, userType);
+    }
+    @Override
+    public RatingResponseDto getRating(Long id) {
+        T rating = getRatingWithHandlingException(id);
+        return ratingMapper.toDto(rating, userType);
+    }
+    @Override
+    public ListContainerResponseDto<RatingResponseDto> getRatingsByRefUserId(Long refUserId,
+                                                                             Integer offset,
+                                                                             Integer limit) {
+        Page<RatingResponseDto> ratingsResponseDto = repository
+                .findAllByRefUserIdAndDeletedIsFalse(refUserId, PageRequest.of(offset, limit))
+                .map(rating -> ratingMapper.toDto(rating, userType));
+        return listContainerMapper.toDto(ratingsResponseDto);
+    }
+    @Override
+    @Transactional
+    public void safeDeleteRating(Long id) {
+        T rating = getRatingWithHandlingException(id);
+        rating.setDeleted(true);
+        repository.save(rating);
+    }
+    @Override
+    public AverageRatingResponseDto getAverageRating(Long refUserId) {
+        AverageRatingResponseDto averageRatingResponseDto = new AverageRatingResponseDto(refUserId,
+                repository.getAverageRatingByRefUserId(refUserId)
+                        .orElseThrow(() -> new RefUserIdNotFoundException(messageSource.getMessage(
+                                AppConstants.REF_USER_ID_NOT_FOUND_MESSAGE_KEY,
+                                new Object[]{userType, refUserId},
+                                LocaleContextHolder.getLocale()
+                        ))));
+        sendAverageRatingToConsumers(averageRatingResponseDto);
+        return averageRatingResponseDto;
+    }
+    private void sendAverageRatingToConsumers(AverageRatingResponseDto averageRatingResponseDto) {
+        if (userType.equals(UserType.DRIVER.toString())) {
+            averageRatingSender.sendAverageRatingToDriver(averageRatingResponseDto);
+        }
+        if (userType.equals(UserType.PASSENGER.toString())) {
+            averageRatingSender.sendAverageRatingToPassenger(averageRatingResponseDto);
+        }
+    }
+    private void checkRatingRestoreOption(RatingRequestDto ratingRequestDto) {
+        Long rideId = ratingRequestDto.rideId();
+        if (Objects.nonNull(rideId) && repository.existsByRideIdAndDeletedIsTrue(rideId)) {
+            throw new DuplicateRideIdException(messageSource.getMessage(
+                    AppConstants.RESTORE_RATING_BY_RIDE_ID,
+                    new Object[]{userType, rideId},
+                    LocaleContextHolder.getLocale()
+            ));
+        }
+    }
+    private void checkRatingExistsByRideId(RatingRequestDto ratingRequestDto) {
+        Long rideId = ratingRequestDto.rideId();
+        if (Objects.nonNull(rideId) && repository.existsByRideIdAndDeletedIsFalse(rideId)) {
+            throw new DuplicateRideIdException(messageSource.getMessage(
+                    AppConstants.RATING_DUPLICATE_RIDE_ID_MESSAGE_KEY,
+                    new Object[]{userType, rideId},
+                    LocaleContextHolder.getLocale()
+            ));
+        }
+    }
+    private void setRefUserIdBasedOnUserType(T rating, RideResponseDto rideResponseDto) {
+        rating.setRefUserId(
+                Objects.equals(userType, String.valueOf(UserType.PASSENGER))
+                        ? rideResponseDto.passengerId()
+                        : rideResponseDto.driverId()
+        );
+    }
+    private T getRatingWithHandlingException(Long id) {
+        return repository.findByIdAndDeletedIsFalse(id)
+                .orElseThrow(() -> new RatingNotFoundException(messageSource.getMessage(
+                        AppConstants.RATING_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{userType, id},
+                        LocaleContextHolder.getLocale()
+                )));
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/service/impl/DriverRatingService.java
+@Service
+public class DriverRatingService extends AbstractRatingService<DriverRating, DriverRatingRepository> {
+    @Autowired
+    public DriverRatingService(DriverRatingRepository repository,
+                               DriverRatingMapper ratingMapper,
+                               ListContainerMapper listContainerMapper,
+                               MessageSource messageSource,
+                               RideFeignClient rideFeignClient,
+                               AverageRatingSender averageRatingSender) {
+        super(repository, ratingMapper, listContainerMapper,
+                messageSource,rideFeignClient, averageRatingSender, UserType.DRIVER.toString());
+    }
+}
+
+// Файл: rating-service/src/main/java/com/modsen/ratingservice/service/impl/PassengerRatingService.java
+@Service
+public class PassengerRatingService extends AbstractRatingService<PassengerRating, PassengerRatingRepository> {
+    @Autowired
+    public PassengerRatingService(PassengerRatingRepository repository,
+                                  PassengerRatingMapper ratingMapper,
+                                  ListContainerMapper listContainerMapper,
+                                  MessageSource messageSource,
+                                  RideFeignClient rideFeignClient,
+                                  AverageRatingSender averageRatingSender) {
+        super(repository, ratingMapper, listContainerMapper,
+                messageSource, rideFeignClient, averageRatingSender, UserType.PASSENGER.toString());
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/client/CustomFeignClientException.java
+@Getter
+public class CustomFeignClientException extends RuntimeException {
+    private final ApiExceptionDto apiExceptionDto;
+    public CustomFeignClientException(ApiExceptionDto apiExceptionDto) {
+        this.apiExceptionDto = apiExceptionDto;
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/client/FeignClientErrorDecoder.java
+@Component
+public class FeignClientErrorDecoder implements ErrorDecoder {
+    private final Default eDefault = new Default();
+    @Override
+    @SneakyThrows
+    public Exception decode(String s, Response response) {
+        ObjectMapper objectMapper = new ObjectMapper();
+        objectMapper.registerModule(new JavaTimeModule());
+        ApiExceptionDto apiExceptionDto;
+        if (response.status() >= HttpStatus.INTERNAL_SERVER_ERROR.value()) {
+            return eDefault.decode(s, response);
+        }
+        if (response.status() == HttpStatus.UNAUTHORIZED.value()) {
+            return new KeycloakCreateUserException(new ApiExceptionDto(
+                    HttpStatus.UNAUTHORIZED,
+                    "",
+                    LocalDateTime.now()));
+        }
+        apiExceptionDto = objectMapper.readValue(readResponseBody(response), ApiExceptionDto.class);
+        return new CustomFeignClientException(apiExceptionDto);
+    }
+    @SneakyThrows
+    private String readResponseBody(Response response) {
+        if (Objects.nonNull(response.body())) {
+            @Cleanup InputStreamReader inputStreamReader = new InputStreamReader(response.body()
+                    .asInputStream(), StandardCharsets.UTF_8);
+            StringBuilder builder = new StringBuilder();
+            BufferedReader reader = new BufferedReader(inputStreamReader);
+            String line;
+            while ((line = reader.readLine()) != null) {
+                builder.append(line);
+            }
+            return builder.toString();
+        }
+        return "";
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/client/driver/DriverFeignClientFallbackFactory.java
+@Component
+public class DriverFeignClientFallbackFactory implements FallbackFactory<DriverFeignClient> {
+    @Override
+    public DriverFeignClient create(Throwable cause) {
+        return (driverId, acceptLanguage, authorization) -> {
+            if (cause.getCause() instanceof CustomFeignClientException customFeignClientException) {
+                throw customFeignClientException;
+            }
+            throw new ServerErrorException(cause.getMessage(), cause);
+        };
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/client/passenger/PassengerFeignClientFallbackFactory.java
+@Component
+public class PassengerFeignClientFallbackFactory implements FallbackFactory<PassengerFeignClient> {
+    @Override
+    public PassengerFeignClient create(Throwable cause) {
+        return (passengerId, acceptLanguage, authorization) -> {
+            if (cause.getCause() instanceof CustomFeignClientException customFeignClientException) {
+                throw customFeignClientException;
+            }
+            throw new ServerErrorException(cause.getMessage(), cause);
+        };
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/controller/impl/UserManagementController.java
+@RestController
+@RequestMapping("/api/v1/cab-aggregator")
+@RequiredArgsConstructor
+@CrossOrigin(origins = "*")
+public class UserManagementController implements UserManagementOperations {
+    private final UserManagementService userManagementService;
+    @Override
+    @PostMapping("/signin")
+    public UserKeycloakTokenResponseDto signIn(@Valid @RequestBody SignInDto signInDto) {
+        return userManagementService.signIn(signInDto);
+    }
+    @Override
+    @PostMapping("/signup")
+    @ResponseStatus(HttpStatus.CREATED)
+    public void signUp(@Valid @RequestBody SignUpDto signUpDto) {
+        userManagementService.signUp(signUpDto);
+    }
+    @Override
+    @PostMapping("/signin/admin")
+    public AdminKeycloakTokenResponseDto signInAsAdmin(@Valid @RequestBody SignInAdminDto signInAdminDto) {
+        return userManagementService.signInAsAdmin(signInAdminDto);
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/exception/GlobalExceptionHandler.java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+    @ExceptionHandler(ServiceUnavailableException.class)
+    @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
+    public ApiExceptionDto handleServiceUnavailableException(Exception e) {
+        log.error(e.getMessage(), e);
+        return new ApiExceptionDto(
+                HttpStatus.SERVICE_UNAVAILABLE,
+                e.getMessage(),
+                LocalDateTime.now());
+    }
+    @ExceptionHandler(CustomFeignClientException.class)
+    public ResponseEntity<ApiExceptionDto> handleRideNotFoundException(CustomFeignClientException e) {
+        ApiExceptionDto exceptionDto = e.getApiExceptionDto();
+        return ResponseEntity.status(exceptionDto.getStatus()).body(e.getApiExceptionDto());
+    }
+    @ExceptionHandler(KeycloakCreateUserException.class)
+    public ResponseEntity<ApiExceptionDto> handleKeycloakCreateUserException(KeycloakCreateUserException e) {
+        ApiExceptionDto exceptionDto = e.getApiExceptionDto();
+        return ResponseEntity.status(exceptionDto.getStatus()).body(e.getApiExceptionDto());
+    }
+    @ExceptionHandler(KeycloakException.class)
+    public ResponseEntity<ApiExceptionDto> handleKeycloakException(KeycloakException e) {
+        ApiExceptionDto exceptionDto = e.getApiExceptionDto();
+        return ResponseEntity.status(exceptionDto.getStatus()).body(e.getApiExceptionDto());
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/exception/keycloak/KeycloakCreateUserException.java
+@Getter
+public class KeycloakCreateUserException extends RuntimeException {
+    private final ApiExceptionDto apiExceptionDto;
+    public KeycloakCreateUserException(ApiExceptionDto apiExceptionDto) {
+        this.apiExceptionDto = apiExceptionDto;
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/exception/keycloak/KeycloakException.java
+@Getter
+public class KeycloakException extends RuntimeException {
+    private final ApiExceptionDto apiExceptionDto;
+    public KeycloakException(ApiExceptionDto apiExceptionDto) {
+        this.apiExceptionDto = apiExceptionDto;
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/exception/validation/AccessRoles.java
+public enum AccessRoles {
+    PASSENGER,
+    DRIVER
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/exception/validation/EnumTypeSubset.java
+@Target({FIELD})
+@Retention(RUNTIME)
+@Documented
+@Constraint(validatedBy = {EnumTypeSubsetValidator.class})
+public @interface EnumTypeSubset {
+    Class<? extends Enum<?>> enumClass();
+    String message() default AppConstants.ENUM_TYPE_INVALID_MESSAGE_KEY;
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/exception/validation/GenderTypes.java
+public enum GenderTypes {
+    MALE,
+    FEMALE
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/exception/validation/provider/EnumTypeSubsetValidator.java
+public class EnumTypeSubsetValidator implements ConstraintValidator<EnumTypeSubset, Object> {
+    private Class<? extends Enum<?>> enumClass;
+    @Override
+    public void initialize(EnumTypeSubset constraintAnnotation) {
+        this.enumClass = constraintAnnotation.enumClass();
+    }
+    @Override
+    public boolean isValid(Object value, ConstraintValidatorContext constraintValidatorContext) {
+        if (value == null) {
+            return true;
+        }
+        for (Enum<?> e : enumClass.getEnumConstants()) {
+            if (e.name().equals(value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/service/ServiceConstants.java
+@NoArgsConstructor(access = AccessLevel.PRIVATE)
+public class ServiceConstants {
+    public static final String GRANT_TYPE_FIELD = "grant_type";
+    public static final String USERNAME_FIELD = "username";
+    public static final String PASSWORD_FIELD = "password";
+    public static final String CLIENT_ID_FIELD = "client_id";
+    public static final String CLIENT_SECRET_FIELD = "client_secret";
+    public static final String GENDER_ATTRIBUTE_FIELD = "gender";
+    public static final String GRANT_TYPE_PASSWORD_FIELD = "password";
+    public static final String GRANT_TYPE_CLIENT_CREDENTIALS_FIELD = "client_credentials";
+    public static final String PASSENGER_ROLE = "PASSENGER";
+}
+
+// Файл: registration-service/src/main/java/com/modsen/registrationservice/service/impl/UserManagementServiceImpl.java
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class UserManagementServiceImpl implements UserManagementService {
+    private final Keycloak keycloak;
+    private final RestTemplate restTemplate;
+    private final KeycloakProperties keycloakProperties;
+    private final DriverFeignClient driverFeignClient;
+    private final PassengerFeignClient passengerFeignClient;
+    private final MessageSource messageSource;
+    private final ObjectMapper objectMapper;
+    @Override
+    public void signUp(SignUpDto signUpDto) {
+        UserRepresentation keycloakUser = getUserRepresentation(signUpDto);
+        RealmResource realmResource = keycloak.realm(keycloakProperties.getRealm());
+        UsersResource usersResource = realmResource.users();
+        String adminClientAccessToken = keycloak.tokenManager().getAccessTokenString();
+        Response response;
+        response = Optional.ofNullable(usersResource.create(keycloakUser))
+                .orElseThrow(() -> new ServiceUnavailableException(messageSource.getMessage(
+                        SERVICE_UNAVAILABLE_MESSAGE_KEY,
+                        new Object[]{},
+                        LocaleContextHolder.getLocale())));
+        if (response.getStatus() == HttpStatus.CREATED.value()) {
+            try {
+                if (Objects.equals(signUpDto.role(), PASSENGER_ROLE)) {
+                    passengerFeignClient.createPassenger(signUpDto, LocaleContextHolder.getLocale().toLanguageTag(),
+                            "Bearer " + adminClientAccessToken);
+                } else {
+                    driverFeignClient.createDriver(signUpDto, LocaleContextHolder.getLocale().toLanguageTag(),
+                            "Bearer " + adminClientAccessToken);
+                }
+            } catch (Exception exception) {
+                usersResource.delete(CreatedResponseUtil.getCreatedId(response));
+                throw exception;
+            }
+        } else {
+            throw new KeycloakCreateUserException(
+                    new ApiExceptionDto(HttpStatus.valueOf(response.getStatus()),
+                            readResponseBody(response),
+                            LocalDateTime.now()));
+        }
+        RolesResource rolesResource = realmResource.roles();
+        RoleRepresentation role = rolesResource.get(signUpDto.role()).toRepresentation();
+        UserResource userById = usersResource.get(CreatedResponseUtil.getCreatedId(response));
+        userById.roles()
+                .realmLevel()
+                .add(List.of(role));
+    }
+    @Override
+    @SneakyThrows
+    public UserKeycloakTokenResponseDto signIn(SignInDto signInDto) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+        MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+        body.add(GRANT_TYPE_FIELD, GRANT_TYPE_PASSWORD_FIELD);
+        body.add(USERNAME_FIELD, signInDto.email());
+        body.add(PASSWORD_FIELD, signInDto.password());
+        body.add(CLIENT_ID_FIELD, keycloakProperties.getAuth().getClientId());
+        HttpEntity<MultiValueMap<String, String>> requestEntity = new HttpEntity<>(body, headers);
+        ResponseEntity<String> response = getResponseWithToken(requestEntity);
+        handleAnyStatusCodeExceptOk(response);
+        return objectMapper.readValue(response.getBody(),
+                UserKeycloakTokenResponseDto.class);
+    }
+    @Override
+    @SneakyThrows
+    public AdminKeycloakTokenResponseDto signInAsAdmin(SignInAdminDto signInDto) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_FORM_URLENCODED);
+        MultiValueMap<String, String> body = new LinkedMultiValueMap<>();
+        body.add(GRANT_TYPE_FIELD, GRANT_TYPE_CLIENT_CREDENTIALS_FIELD);
+        body.add(CLIENT_ID_FIELD, signInDto.clientId());
+        body.add(CLIENT_SECRET_FIELD, signInDto.clientSecret());
+        HttpEntity<MultiValueMap<String, String>> requestEntity = new HttpEntity<>(body, headers);
+        ResponseEntity<String> response = getResponseWithToken(requestEntity);
+        handleAnyStatusCodeExceptOk(response);
+        return objectMapper.readValue(getResponseWithToken(requestEntity).getBody(),
+                AdminKeycloakTokenResponseDto.class);
+    }
+    private void handleAnyStatusCodeExceptOk(ResponseEntity<String> response) {
+        if (response.getStatusCode() != HttpStatus.OK) {
+            throw new KeycloakException(
+                    new ApiExceptionDto(HttpStatus.valueOf(response.getStatusCode().value()),
+                            response.getBody(),
+                            LocalDateTime.now()));
+        }
+    }
+    private String getAuthUrl() {
+        return keycloakProperties.getUserManagement().getServerUrl() +
+                "/realms/" + keycloakProperties.getRealm() +
+                "/protocol/openid-connect/token";
+    }
+    private ResponseEntity<String> getResponseWithToken(HttpEntity<MultiValueMap<String, String>> requestEntity) {
+        ResponseEntity<String> response;
+        try {
+            response = restTemplate.exchange(getAuthUrl(), HttpMethod.POST, requestEntity, String.class);
+        } catch (HttpClientErrorException exception) {
+            throw new KeycloakCreateUserException(
+                    new ApiExceptionDto(HttpStatus.valueOf(exception.getStatusCode().value()),
+                            exception.getMessage(),
+                            LocalDateTime.now()));
+        }
+        return response;
+    }
+    private UserRepresentation getUserRepresentation(SignUpDto signUpDto) {
+        UserRepresentation keycloakUser = new UserRepresentation();
+        CredentialRepresentation credential = new CredentialRepresentation();
+        credential.setType(CredentialRepresentation.PASSWORD);
+        credential.setValue(signUpDto.password());
+        Map<String, List<String>> attributes = new HashMap<>();
+        attributes.put(ServiceConstants.GENDER_ATTRIBUTE_FIELD, List.of(signUpDto.gender()));
+        keycloakUser.setFirstName(signUpDto.firstName());
+        keycloakUser.setLastName(signUpDto.lastName());
+        keycloakUser.setEmail(signUpDto.email());
+        keycloakUser.setCredentials(List.of(credential));
+        keycloakUser.setEnabled(true);
+        keycloakUser.setAttributes(attributes);
+        return keycloakUser;
+    }
+    @SneakyThrows
+    private String readResponseBody(Response response) {
+        if (Objects.nonNull(response)) {
+            @Cleanup InputStreamReader inputStreamReader = new InputStreamReader(response.readEntity(InputStream.class),
+                    StandardCharsets.UTF_8);
+            StringBuilder builder = new StringBuilder();
+            BufferedReader reader = new BufferedReader(inputStreamReader);
+            String line;
+            while ((line = reader.readLine()) != null) {
+                builder.append(line);
+            }
+            return builder.toString()
+                    .replace("\"errorMessage\":", "")
+                    .replace("\"", "");
+        }
+        return "";
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/client/CustomFeignClientException.java
+@Getter
+public class CustomFeignClientException extends RuntimeException {
+    private final ApiExceptionDto apiExceptionDto;
+    public CustomFeignClientException(ApiExceptionDto apiExceptionDto) {
+        this.apiExceptionDto = apiExceptionDto;
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/client/FeignClientErrorDecoder.java
+@Component
+public class FeignClientErrorDecoder implements ErrorDecoder {
+    private final ErrorDecoder.Default eDefault = new ErrorDecoder.Default();
+    @Override
+    @SneakyThrows
+    public Exception decode(String s, Response response) {
+        ObjectMapper objectMapper = new ObjectMapper();
+        objectMapper.registerModule(new JavaTimeModule());
+        ApiExceptionDto apiExceptionDto;
+        if (response.status() >= HttpStatus.INTERNAL_SERVER_ERROR.value()) {
+            return eDefault.decode(s, response);
+        }
+        apiExceptionDto = objectMapper.readValue(readResponseBody(response), ApiExceptionDto.class);
+        return new CustomFeignClientException(apiExceptionDto);
+    }
+    @SneakyThrows
+    private String readResponseBody(Response response) {
+        if (Objects.nonNull(response.body())) {
+            @Cleanup InputStreamReader inputStreamReader = new InputStreamReader(response.body()
+                    .asInputStream(), StandardCharsets.UTF_8);
+            StringBuilder builder = new StringBuilder();
+            BufferedReader reader = new BufferedReader(inputStreamReader);
+            String line;
+            while ((line = reader.readLine()) != null) {
+                builder.append(line);
+            }
+            return builder.toString();
+        }
+        return "";
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/client/driver/DriverFeignClientFallbackFactory.java
+@Component
+public class DriverFeignClientFallbackFactory implements FallbackFactory<DriverFeignClient> {
+    @Override
+    public DriverFeignClient create(Throwable cause) {
+        return (driverId, acceptLanguage, authorization) -> {
+            if (cause.getCause() instanceof CustomFeignClientException customFeignClientException) {
+                throw customFeignClientException;
+            }
+            throw new ServerErrorException(cause.getMessage(), cause);
+        };
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/client/passenger/PassengerFeignClientFallbackFactory.java
+@Component
+public class PassengerFeignClientFallbackFactory implements FallbackFactory<PassengerFeignClient> {
+    @Override
+    public PassengerFeignClient create(Throwable cause) {
+        return (passengerId, acceptLanguage, authorization) -> {
+            if (cause.getCause() instanceof CustomFeignClientException customFeignClientException) {
+                throw customFeignClientException;
+            }
+            throw new ServerErrorException(cause.getMessage(), cause);
+        };
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/controller/impl/RideController.java
+@RestController
+@RequestMapping("/api/v1/rides")
+@RequiredArgsConstructor
+public class RideController implements RideOperations {
+    private final RideService rideService;
+    @Override
+    @GetMapping
+    public ListContainerResponseDto<RideResponseDto> getPageRides(@Min(0) Integer offset,
+                                                                  @Min(1) @Max(100) Integer limit) {
+        return rideService.getPageRides(offset, limit);
+    }
+    @Override
+    @GetMapping("/{rideId}")
+    public RideResponseDto getRideById(@PathVariable Long rideId) {
+        return rideService.getRideById(rideId);
+    }
+    @Override
+    @GetMapping("/drivers/{driverId}")
+    public ListContainerResponseDto<RideResponseDto> getPageRidesByDriverId(@PathVariable Long driverId,
+                                                                            @Min(0) Integer offset,
+                                                                            @Min(1) @Max(100) Integer limit) {
+        return rideService.getPageRidesByDriverId(driverId, offset, limit);
+    }
+    @Override
+    @GetMapping("/passengers/{passengerId}")
+    public ListContainerResponseDto<RideResponseDto> getPageRidesByPassengerId(@PathVariable Long passengerId,
+                                                                               @Min(0) Integer offset,
+                                                                               @Min(1) @Max(100) Integer limit) {
+        return rideService.getPageRidesByPassengerId(passengerId, offset, limit);
+    }
+    @Override
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    @PreAuthorize("hasRole('ADMIN') or hasRole('PASSENGER')")
+    public RideResponseDto createRide(@Valid @RequestBody RideRequestDto rideRequestDto) {
+        return rideService.createRide(rideRequestDto);
+    }
+    @Override
+    @PatchMapping("/{rideId}/status")
+    @PreAuthorize("hasRole('ADMIN') or hasRole('DRIVER') or hasRole('PASSENGER')")
+    public RideResponseDto changeRideStatus(
+            @PathVariable Long rideId,
+            @RequestBody @Valid RideStatusRequestDto rideStatusRequestDto) {
+        return rideService.changeRideStatus(rideId, rideStatusRequestDto);
+    }
+    @Override
+    @PutMapping("/{rideId}")
+    @PreAuthorize("hasRole('ADMIN')")
+    public RideResponseDto updateRide(@PathVariable Long rideId,
+                                      @RequestBody @Valid RideRequestDto rideRequestDto) {
+        return rideService.updateRide(rideId, rideRequestDto);
+    }
+    @Override
+    @GetMapping("/passengers/{passengerId}/statistics")
+    public RideStatisticResponseDto getRideStatisticForPassenger(@PathVariable("passengerId") Long passengerId) {
+        return rideService.getRideStatisticForPassenger(passengerId);
+    }
+    @Override
+    @GetMapping("/drivers/{driverId}/statistics")
+    public RideStatisticResponseDto getRideStatisticForDriver(@PathVariable("driverId") Long driverId) {
+        return rideService.getRideStatisticForDriver(driverId);
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/exception/GlobalExceptionHandler.java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+    @ExceptionHandler({RideNotFoundException.class})
+    @ResponseStatus(HttpStatus.NOT_FOUND)
+    public ApiExceptionDto handleRideNotFoundException(Exception e) {
+        return new ApiExceptionDto(
+                HttpStatus.NOT_FOUND,
+                e.getMessage(),
+                LocalDateTime.now());
+    }
+    @ExceptionHandler({HttpMessageNotReadableException.class})
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public ApiExceptionDto handleHttpMessageNotReadableException(Exception e) {
+        return new ApiExceptionDto(
+                HttpStatus.BAD_REQUEST,
+                e.getMessage(),
+                LocalDateTime.now());
+    }
+    @ExceptionHandler({InvalidInputStatusException.class})
+    @ResponseStatus(HttpStatus.CONFLICT)
+    public ApiExceptionDto handleInvalidInputStatusException(Exception e) {
+        return new ApiExceptionDto(
+                HttpStatus.CONFLICT,
+                e.getMessage(),
+                LocalDateTime.now());
+    }
+    @ExceptionHandler(CustomFeignClientException.class)
+    public ResponseEntity<ApiExceptionDto> handleRideNotFoundException(CustomFeignClientException e) {
+        ApiExceptionDto exceptionDto = e.getApiExceptionDto();
+        return ResponseEntity.status(exceptionDto.getStatus()).body(e.getApiExceptionDto());
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/exception/ride/InvalidInputStatusException.java
+public class InvalidInputStatusException extends RuntimeException {
+    public InvalidInputStatusException(String message) {
+        super(message);
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/exception/ride/RideNotFoundException.java
+public class RideNotFoundException extends RuntimeException {
+    public RideNotFoundException(String message) {
+        super(message);
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/exception/validation/EnumTypeSubset.java
+@Target({METHOD, FIELD, ANNOTATION_TYPE, CONSTRUCTOR, PARAMETER, TYPE_USE})
+@Retention(RUNTIME)
+@Documented
+@Constraint(validatedBy = {EnumTypeSubsetValidator.class})
+public @interface EnumTypeSubset {
+    Class<? extends Enum<?>> enumClass();
+    String message() default AppConstants.ENUM_TYPE_INVALID_MESSAGE_KEY;
+    Class<?>[] groups() default {};
+    Class<? extends Payload>[] payload() default {};
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/exception/validation/provider/EnumTypeSubsetValidator.java
+public class EnumTypeSubsetValidator implements ConstraintValidator<EnumTypeSubset, Object> {
+    private Class<? extends Enum<?>> enumClass;
+    @Override
+    public void initialize(EnumTypeSubset constraintAnnotation) {
+        this.enumClass = constraintAnnotation.enumClass();
+    }
+    @Override
+    public boolean isValid(Object value, ConstraintValidatorContext constraintValidatorContext) {
+        if (value == null) {
+            return true;
+        }
+        for (Enum<?> e : enumClass.getEnumConstants()) {
+            if (e.name().equals(value)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/service/component/RideServicePriceGenerator.java
+@Component
+public class RideServicePriceGenerator {
+    private static final int SCALE = 2;
+    private static final BigDecimal MAX_VALUE = new BigDecimal("99999.99");
+    public BigDecimal generateRandomCost() {
+        Random random = new Random();
+        int integerPart = random.nextInt(MAX_VALUE.intValue() + 1);
+        int fractionalPart = random.nextInt(100);
+        BigDecimal randomCost = new BigDecimal(integerPart + "." + String.format("%02d", fractionalPart));
+        return randomCost.setScale(SCALE, RoundingMode.HALF_UP);
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/service/component/RideServiceValidation.java
+@Component
+@RequiredArgsConstructor
+public class RideServiceValidation {
+    private final MessageSource messageSource;
+    private final PassengerFeignClient passengerFeignClient;
+    private final DriverFeignClient driverFeignClient;
+    public void validateChangingRideStatus(Ride ride, RideStatusRequestDto rideStatusRequestDto) {
+        RideStatus currentStatus = ride.getRideStatus();
+        RideStatus newStatus = RideStatus.valueOf(rideStatusRequestDto.rideStatus());
+        checkCanceledStatus(currentStatus);
+        switch (currentStatus) {
+            case CREATED:
+                logicCheckStatus(currentStatus, newStatus, RideStatus.ACCEPTED);
+                break;
+            case ACCEPTED:
+                logicCheckStatus(currentStatus, newStatus, RideStatus.ON_THE_WAY_TO_PASSENGER);
+                break;
+            case ON_THE_WAY_TO_PASSENGER:
+                logicCheckStatus(currentStatus, newStatus, RideStatus.ON_THE_WAY_TO_DESTINATION);
+                break;
+            case ON_THE_WAY_TO_DESTINATION:
+                logicCheckStatus(currentStatus, newStatus, RideStatus.COMPLETED);
+                break;
+        }
+    }
+    public void checkExistingPassengerOrDriver(RideRequestDto rideRequestDto) {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        JwtAuthenticationToken token = (JwtAuthenticationToken) authentication;
+        if (Objects.nonNull(rideRequestDto.passengerId())) {
+            passengerFeignClient
+                    .findPassengerById(rideRequestDto.passengerId(), LocaleContextHolder.getLocale().toLanguageTag(),
+                            "Bearer " + token.getToken().getTokenValue());
+        }
+        if (Objects.nonNull(rideRequestDto.driverId())) {
+            driverFeignClient
+                    .findDriverById(rideRequestDto.driverId(), LocaleContextHolder.getLocale().toLanguageTag(),
+                            "Bearer " + token.getToken().getTokenValue());
+        }
+    }
+    private void logicCheckStatus(RideStatus currentStatus, RideStatus newStatus, RideStatus potentialStatus) {
+        if (newStatus != potentialStatus && newStatus != RideStatus.CANCELED) {
+            throw new InvalidInputStatusException(messageSource.getMessage(
+                    AppConstants.INVALID_INPUT_STATUS_MESSAGE_KEY,
+                    new Object[]{currentStatus, newStatus},
+                    LocaleContextHolder.getLocale()));
+        }
+    }
+    private void checkCanceledStatus(RideStatus status) {
+        if (status == RideStatus.CANCELED) {
+            throw new InvalidInputStatusException(messageSource.getMessage(
+                    AppConstants.CANCELED_STATUS_MESSAGE_KEY,
+                    new Object[]{},
+                    LocaleContextHolder.getLocale()
+            ));
+        }
+    }
+}
+
+// Файл: rides-service/src/main/java/com/modsen/ridesservice/service/impl/RideServiceImpl.java
+@Service
+@RequiredArgsConstructor
+public class RideServiceImpl implements RideService {
+    private final RideRepository rideRepository;
+    private final RideMapper rideMapper;
+    private final ListContainerMapper listContainerMapper;
+    private final MessageSource messageSource;
+    private final RideServicePriceGenerator priceGenerator;
+    private final RideServiceValidation rideServiceValidation;
+    @Override
+    @Transactional
+    public RideResponseDto createRide(RideRequestDto rideRequestDto) {
+        rideServiceValidation.checkExistingPassengerOrDriver(rideRequestDto);
+        Ride ride = rideMapper.toEntity(rideRequestDto);
+        ride.setRideStatus(RideStatus.CREATED);
+        ride.setCost(priceGenerator.generateRandomCost());
+        ride.setOrderDateTime(LocalDateTime.now());
+        rideRepository.save(ride);
+        return rideMapper.toDto(ride);
+    }
+    @Override
+    @Transactional
+    @CachePut(value = AppConstants.RIDE_CACHE_VALUE,
+            condition = "#result.rideStatus() == 'CANCELED' || #result.rideStatus() == 'COMPLETED'",
+            key = "#result.id()")
+    public RideResponseDto changeRideStatus(Long rideId, RideStatusRequestDto rideStatusRequestDto) {
+        Ride ride = getRide(rideId);
+        rideServiceValidation.validateChangingRideStatus(ride, rideStatusRequestDto);
+        rideMapper.partialUpdate(rideStatusRequestDto, ride);
+        rideRepository.save(ride);
+        return rideMapper.toDto(ride);
+    }
+    @Override
+    @Transactional
+    @CachePut(value = AppConstants.RIDE_CACHE_VALUE,
+            condition = "#result.rideStatus() == 'CANCELED' || #result.rideStatus() == 'COMPLETED'",
+            key = "#result.id()")
+    public RideResponseDto updateRide(Long rideId, RideRequestDto rideRequestDto) {
+        rideServiceValidation.checkExistingPassengerOrDriver(rideRequestDto);
+        Ride ride = getRide(rideId);
+        rideMapper.partialUpdate(rideRequestDto, ride);
+        rideRepository.save(ride);
+        return rideMapper.toDto(ride);
+    }
+    @Override
+    @Cacheable(value = AppConstants.RIDE_CACHE_VALUE,
+            unless = "#result.rideStatus() != 'CANCELED' && #result.rideStatus() != 'COMPLETED'",
+            key = "#rideId")
+    public RideResponseDto getRideById(Long rideId) {
+        Ride ride = getRide(rideId);
+        return rideMapper.toDto(ride);
+    }
+    @Override
+    public ListContainerResponseDto<RideResponseDto> getPageRides(Integer offset, Integer limit) {
+        Page<RideResponseDto> rideResponsePageDto = rideRepository
+                .findAll(PageRequest.of(offset, limit))
+                .map(rideMapper::toDto);
+        return listContainerMapper.toDto(rideResponsePageDto);
+    }
+    @Override
+    public ListContainerResponseDto<RideResponseDto> getPageRidesByDriverId(Long driverId,
+                                                                            Integer offset,
+                                                                            Integer limit) {
+        Page<RideResponseDto> rideResponsePageDto = rideRepository
+                .findAllByDriverId(driverId, PageRequest.of(offset, limit))
+                .map(rideMapper::toDto);
+        return listContainerMapper.toDto(rideResponsePageDto);
+    }
+    @Override
+    public ListContainerResponseDto<RideResponseDto> getPageRidesByPassengerId(Long passengerId,
+                                                                               Integer offset,
+                                                                               Integer limit) {
+        Page<RideResponseDto> rideResponsePageDto = rideRepository
+                .findAllByPassengerId(passengerId, PageRequest.of(offset, limit))
+                .map(rideMapper::toDto);
+        return listContainerMapper.toDto(rideResponsePageDto);
+    }
+    @Override
+    public RideStatisticResponseDto getRideStatisticForDriver(Long driverId) {
+        List<Ride> rides = rideRepository.findAllRidesForReportByDriverId(driverId);
+        return getRideStatistic(rides, driverId);
+    }
+    @Override
+    public RideStatisticResponseDto getRideStatisticForPassenger(Long passengerId) {
+        List<Ride> rides = rideRepository.findAllRidesForReportByPassengerId(passengerId);
+        return getRideStatistic(rides, passengerId);
+    }
+    private RideStatisticResponseDto getRideStatistic(List<Ride> rides, Long refUserId) {
+        List<RideResponseDto> ridesResponseDto = rides
+                .stream()
+                .map(rideMapper::toDto)
+                .toList();
+        if (ridesResponseDto.isEmpty()) {
+            return RideStatisticResponseDto.builder()
+                    .withRides(ridesResponseDto)
+                    .withUserRefId(refUserId)
+                    .withAverageCost(BigDecimal.ZERO)
+                    .build();
+        }
+        BigDecimal averageCost = ridesResponseDto
+                .stream()
+                .map(RideResponseDto::cost)
+                .reduce(BigDecimal.ZERO, BigDecimal::add)
+                .divide(BigDecimal.valueOf(ridesResponseDto.size()), RoundingMode.HALF_UP);
+        return RideStatisticResponseDto.builder()
+                .withRides(ridesResponseDto)
+                .withUserRefId(refUserId)
+                .withAverageCost(averageCost)
+                .build();
+    }
+    private Ride getRide(Long rideId) {
+        return rideRepository.findById(rideId)
+                .orElseThrow(() -> new RideNotFoundException(messageSource.getMessage(
+                        AppConstants.RIDE_NOT_FOUND_MESSAGE_KEY,
+                        new Object[]{rideId},
+                        LocaleContextHolder.getLocale())));
+    }
+}
